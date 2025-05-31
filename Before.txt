@@ -1,0 +1,11 @@
+English: pyCMD  (Before Installing....)
+
+It is a tabbed CMD (terminal) application with a redesign and even better!
+Especially for Windows 10 since it does not have a new terminal, although the program is in development so if you put an unsupported command it is possible that the program does not work or damages the operating system or the operating system (Windows) gives you a BSOD (blue screen of death)
+
+Spanish : pyCMD (Antes de Installar....)
+
+Es Un Aplicacion De CMD (terminal) Con Pestañas y Con Rediseño y Aun Mas Mejor! 
+Especialmente Para Windows 10 ya que no Tiene un termianal Nuevo, Aunque El Programa Esta en Desarrollo Asi Que Si Pones Un Comando No Conpatible Es Posible Que El Programa No Funcione o Dañe El Sistema Operativo o el Sistema Operativo (Windows) te salga BSOD (pantalla azul de La Muerte)
+
+Andrew Studies (C) All Rights Reserved
