@@ -6,8 +6,11 @@ from io import StringIO
 import io
 import threading # For background command execution
 import queue # For inter-thread communication
+import traceback # Import for traceback handling
+import platform # Added for systeminfo command
+import json # Added for session serialization
 
-# Import for checking and elevating privileges on Windows
+# Imports for checking and elevating privileges on Windows
 import ctypes
 # Try importing win32api and win32con, but continue without them if unavailable
 try:
@@ -23,7 +26,7 @@ from PySide6.QtCore import Qt, QTimer, QSize, Signal, QThread, QObject
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                                QLabel, QPushButton, QTextEdit, QLineEdit, QTabWidget,
                                QMessageBox, QMenu, QFileDialog, QInputDialog, QDialog, QComboBox,
-                               QSplitter) # QSplitter added
+                               QSplitter, QProgressBar) # QProgressBar added
 from PySide6.QtGui import QIcon, QAction, QPalette, QColor, QTextCursor, QFont, QPixmap
 
 # Try importing win32mica but continue without it if unavailable
@@ -46,7 +49,7 @@ def is_admin():
 
 # Function to restart the application with administrator privileges
 def run_as_admin():
-    """Restarts the application with administrator privileges on Windows."""
+    """Starts the application with administrator privileges on Windows."""
     if os.name == 'nt' and HAS_WIN32:
         try:
             # sys.argv[0] is the path to the current script
@@ -77,9 +80,9 @@ class CommandExecutorThread(QThread):
     command_finished = Signal(int)
     error_occurred = Signal(str)
 
-    def __init__(self, command, cwd, input_queue, parent=None):
+    def __init__(self, command_args, cwd, input_queue, parent=None): # Changed command to command_args (list)
         super().__init__(parent)
-        self.command = command
+        self.command_args = command_args # Store as list of arguments
         self.cwd = cwd
         self.input_queue = input_queue
         self.process = None
@@ -89,9 +92,10 @@ class CommandExecutorThread(QThread):
         try:
             # Use subprocess.Popen to execute the command in the background
             # and capture stdin/stdout/stderr for real-time interaction
+            # shell=False when command_args is a list
             self.process = subprocess.Popen(
-                self.command,
-                shell=True,
+                self.command_args, # Pass command_args directly
+                shell=False, # Explicitly set to False
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -127,6 +131,8 @@ class CommandExecutorThread(QThread):
         while self._is_running and self.process.poll() is None:
             try:
                 line = stream.readline()
+                if not self._is_running: # Check again after readline()
+                    break
                 if line:
                     # Detect input prompts (more generic to capture any input request)
                     # Look for common prompt patterns: ends with ?, :, or contains (something/something)
@@ -134,14 +140,23 @@ class CommandExecutorThread(QThread):
                        re.search(r'\(.*\)\s*:\s*$', line) or \
                        re.search(r'\(S/N\)\s*$', line, re.IGNORECASE) or \
                        re.search(r'\(Y/N\)\s*$', line, re.IGNORECASE) or \
-                       re.search(r'Press any key to continue', line, re.IGNORECASE): # For the 'pause' command
+                       re.search(r'Press any key to continue', line, re.IGNORECASE) or \
+                       re.search(r'>>>\s*$', line): # Added for Python interactive prompt
                         self.prompt_detected.emit(line.strip()) # Emit the full prompt
                         # Wait for user input from the queue (comes from the GUI dialog)
-                        user_input = self.input_queue.get(timeout=60) # Wait up to 60 seconds
-                        if self.process and self.process.stdin:
+                        user_input = None
+                        while self._is_running and user_input is None: # Loop until input is received or thread stops
+                            try:
+                                user_input = self.input_queue.get(timeout=0.1) # Short timeout to allow checking _is_running
+                            except queue.Empty:
+                                QThread.msleep(10) # Small pause to avoid busy-waiting
+                                continue
+                        
+                        if self._is_running and self.process and self.process.stdin: # Only write if still running
                             self.process.stdin.write(user_input + '\n')
                             self.process.stdin.flush()
-                        self.input_queue.task_done() # Mark task as complete
+                        if user_input is not None: # Only mark task done if something was retrieved
+                            self.input_queue.task_done()
                     else:
                         color = QColor(255, 0, 0) if is_stderr else QColor(255, 255, 255)
                         self.output_received.emit(line, color)
@@ -151,6 +166,9 @@ class CommandExecutorThread(QThread):
                         break
                     QThread.msleep(10) # Small pause to avoid excessive CPU usage
             except Exception as e:
+                # Handle potential IOError when stream is closed/terminated
+                if not self._is_running: # If we are stopping, this error is expected
+                    break
                 self.error_occurred.emit(f"Error reading stream: {e}")
                 break
 
@@ -160,13 +178,13 @@ class CommandExecutorThread(QThread):
 
     def stop(self):
         """Stops the thread and the process if it's running."""
-        self._is_running = False
-        if self.process and self.process.poll() is None:
-            self.process.terminate() # Try to terminate the process gracefully
-            self.process.wait(timeout=5) # Wait a bit
-            if self.process.poll() is None:
-                self.process.kill() # If it doesn't terminate, kill it
-        self.wait() # Wait for the thread to finish
+        self._is_running = False # Set the flag first
+        if self.process and self.process.poll() is None: # Check if the process is still running
+            self.process.terminate() # Try to terminate gracefully
+            self.process.wait(timeout=5) # Wait a bit for it to terminate
+            if self.process.poll() is None: # If still running after terminate
+                self.process.kill() # Force termination
+        self.wait() # Wait for the QThread to finish its run() method
 
 
 # New class for a single terminal pane
@@ -190,13 +208,31 @@ class TerminalPane(QWidget):
         self.output_text.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         self.layout.addWidget(self.output_text)
 
+        # Layout for command entry and progress bar
+        command_input_layout = QHBoxLayout()
+        command_input_layout.setContentsMargins(0, 0, 0, 0)
+        command_input_layout.setSpacing(5) # Add some spacing between elements
+
         self.command_entry = QLineEdit()
         self.command_entry.setPlaceholderText("Enter command...")
-        self.layout.addWidget(self.command_entry)
+        command_input_layout.addWidget(self.command_entry, 1) # Stretch factor 1
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setTextVisible(False) # Hide percentage text
+        self.progress_bar.setRange(0, 0) # Indeterminate mode (busy indicator)
+        self.progress_bar.setMaximumHeight(20) # Limit height for a sleek look
+        self.progress_bar.hide() # Initially hidden
+        command_input_layout.addWidget(self.progress_bar)
+
+        self.layout.addLayout(command_input_layout)
 
         self.command_thread = None
         self.input_queue = queue.Queue()
         self.awaiting_input = False # Flag for this specific pane
+
+        # Command history for this pane
+        self.command_history = []
+        self.history_index = -1 # -1 means no history item is currently selected
 
         # Context menu for output area (for copy/paste)
         self.output_text.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -206,7 +242,42 @@ class TerminalPane(QWidget):
         menu = self.output_text.createStandardContextMenu()
         menu.exec(self.output_text.mapToGlobal(pos))
 
-    def start_command_execution(self, command, cwd, interpreter):
+    def keyPressEvent(self, event):
+        """Handles key press events for the command entry, specifically for history navigation."""
+        if event.key() == Qt.Key.Key_Up:
+            if self.command_history and self.history_index < len(self.command_history) - 1:
+                self.history_index += 1
+                self.command_entry.setText(self.command_history[len(self.command_history) - 1 - self.history_index])
+                event.accept()
+            else:
+                super().keyPressEvent(event) # Pass to default handler if no history or at end
+        elif event.key() == Qt.Key.Key_Down:
+            if self.command_history and self.history_index > 0:
+                self.history_index -= 1
+                self.command_entry.setText(self.command_history[len(self.command_history) - 1 - self.history_index])
+                event.accept()
+            elif self.command_history and self.history_index == 0:
+                self.history_index = -1
+                self.command_entry.clear()
+                event.accept()
+            else:
+                super().keyPressEvent(event)
+        elif event.key() == Qt.Key.Key_Return or event.key() == Qt.Key.Key_Enter:
+            # When Enter is pressed, reset history index and add current command to history
+            user_input = self.command_entry.text().strip()
+            if user_input and not self.awaiting_input: # Only add to history if it's a new command, not input to a prompt
+                self.command_history.append(user_input)
+                # Keep history size reasonable, e.g., last 100 commands
+                if len(self.command_history) > 100:
+                    self.command_history.pop(0) # Remove oldest command
+            self.history_index = -1 # Reset history index
+            super().keyPressEvent(event) # Let QLineEdit handle the returnPressed signal
+        else:
+            self.history_index = -1 # Reset history index on any other key press (unless it's a modifier key)
+            super().keyPressEvent(event)
+
+
+    def start_command_execution(self, command_args, cwd, interpreter): # Changed command to command_args (list)
         # Stop any existing thread for this pane
         if self.command_thread and self.command_thread.isRunning():
             self.command_thread.stop()
@@ -214,17 +285,9 @@ class TerminalPane(QWidget):
             self.input_queue = queue.Queue() # Reset queue for new command
             self.awaiting_input = False
 
-        actual_command_to_execute = command
-        if interpreter == "powershell":
-            escaped_command = command.replace('"', '`"')
-            actual_command_to_execute = f"powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"{escaped_command}\""
-        elif interpreter == "cmd":
-            # subprocess.Popen with shell=True handles cmd.exe /c by default
-            pass
-        # Note: "pycmd" interpreter commands are handled by PyCMDWindow directly, not by subprocess
-
+        # command_args is now already a list from PyCMDWindow.execute_command_in_pane
         self.command_thread = CommandExecutorThread(
-            actual_command_to_execute, cwd, self.input_queue
+            command_args, cwd, self.input_queue # Pass command_args directly
         )
         self.command_thread.output_received.connect(
             lambda text, color: self.output_received_in_pane.emit(text, color, self)
@@ -241,8 +304,10 @@ class TerminalPane(QWidget):
         self.command_thread.start()
         self.command_entry.setPlaceholderText("Command running...")
         self.command_entry.setEnabled(False) # Disable input while command is running
+        self.progress_bar.show() # Show the progress bar
 
     def send_input_to_command(self, text):
+        """Sends input to the process via the queue."""
         if self.command_thread:
             self.command_thread.send_input(text)
 
@@ -250,11 +315,69 @@ class TerminalPane(QWidget):
         cursor = self.output_text.textCursor()
         cursor.movePosition(QTextCursor.End)
         self.output_text.setTextCursor(cursor)
+
+        # Check for ANSI escape codes
+        ansi_escape_pattern = re.compile(r'\x1b\[([0-9;]*)m')
         
-        self.output_text.setTextColor(color)
-        self.output_text.insertPlainText(text)
-        self.output_text.setTextColor(QColor(255, 255, 255)) # Restore default color
-        self.output_text.ensureCursorVisible() # Ensure the end is visible
+        if ansi_escape_pattern.search(text):
+            # If ANSI codes are present, convert to HTML
+            html_content = self._ansi_to_html(text)
+            self.output_text.insertHtml(html_content)
+        else:
+            # No ANSI codes, apply QColor directly
+            self.output_text.setTextColor(color)
+            self.output_text.insertPlainText(text)
+            self.output_text.setTextColor(QColor(255, 255, 255)) # Restore default after plain text
+
+        self.output_text.ensureCursorVisible()
+
+    def _ansi_to_html(self, ansi_text):
+        # Basic ANSI to HTML converter
+        html_output = ""
+        current_fg_color = "#FFFFFF"  # Default white
+        current_bg_color = "#191919"  # Dark background, matching QTextEdit's background
+
+        # ANSI color codes mapping (hex values for common 3/4-bit colors)
+        ansi_fg_colors = {
+            '30': '#000000', '31': '#FF0000', '32': '#00FF00', '33': '#FFFF00',
+            '34': '#0000FF', '35': '#FF00FF', '36': '#00FFFF', '37': '#FFFFFF',
+            '90': '#808080', '91': '#FF8080', '92': '#80FF80', '93': '#FFFF80',
+            '94': '#8080FF', '95': '#FF80FF', '96': '#80FFFF', '97': '#FFFFFF' # Bright white
+        }
+        ansi_bg_colors = {
+            '40': '#000000', '41': '#800000', '42': '#008000', '43': '#808000',
+            '44': '#000080', '45': '#800080', '46': '#008080', '47': '#C0C0C0', # Light grey
+            '100': '#808080', '101': '#FF0000', '102': '#00FF00', '103': '#FFFF00',
+            '104': '#0000FF', '105': '#FF00FF', '106': '#00FFFF', '107': '#FFFFFF'
+        }
+
+        # Regex to find ANSI escape sequences and split the string
+        ansi_escape_pattern = re.compile(r'(\x1b\[[0-9;]*m)')
+        parts = ansi_escape_pattern.split(ansi_text)
+
+        for part in parts:
+            if ansi_escape_pattern.match(part):
+                # This is an ANSI escape sequence
+                codes_str = part[2:-1] # Remove \x1b[ and m
+                codes = codes_str.split(';') if codes_str else ['0'] # Handle empty code (e.g., \x1b[m) as reset
+
+                for code in codes:
+                    if code == '0': # Reset all attributes
+                        current_fg_color = "#FFFFFF"
+                        current_bg_color = "#191919"
+                    elif code in ansi_fg_colors:
+                        current_fg_color = ansi_fg_colors[code]
+                    elif code in ansi_bg_colors:
+                        current_bg_color = ansi_bg_colors[code]
+                    # Add handling for bold (1), underline (4), etc. if needed
+                    # For simplicity, we're focusing on colors here.
+            else:
+                # This is plain text, apply current colors and escape HTML special characters
+                escaped_text = part.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                html_output += f"<span style='color:{current_fg_color}; background-color:{current_bg_color};'>{escaped_text}</span>"
+        
+        return html_output
+
 
     def set_awaiting_input(self, state):
         self.awaiting_input = state
@@ -262,9 +385,11 @@ class TerminalPane(QWidget):
             self.command_entry.setPlaceholderText("Awaiting input...")
             self.command_entry.setEnabled(True)
             self.command_entry.setFocus()
+            self.progress_bar.hide() # Hide progress bar when awaiting input
         else:
             self.command_entry.setPlaceholderText("Enter command...")
             self.command_entry.setEnabled(True) # Re-enable after input is sent or command finishes
+            # Progress bar might still be visible if command is running in background
 
     def stop_pane_thread(self):
         if self.command_thread:
@@ -274,6 +399,7 @@ class TerminalPane(QWidget):
             self.awaiting_input = False
             self.command_entry.setPlaceholderText("Enter command...")
             self.command_entry.setEnabled(True)
+            self.progress_bar.hide() # Hide progress bar when thread is stopped
 
 
 class PyCMDWindow(QMainWindow):
@@ -281,26 +407,57 @@ class PyCMDWindow(QMainWindow):
         super().__init__()
         # Initialize admin status at startup
         self.is_admin_mode = is_admin()
-        self.base_title = "pyCMD 25.0.0.0"
+        self.base_title = "pyCMD 25.0.1.0"
         self.setWindowTitle(f"{self.base_title} (Administrator)" if self.is_admin_mode else self.base_title)
         self.setWindowIcon(QIcon("icon.png"))  # Correct method with QIcon
         self.setGeometry(100, 100, 850, 450)  # (x_pos, y_pos, width, height)
         
         # First, initialize variables
-        self.command_history = []
+        self.username = os.getlogin() # Get current username
+        self.hostname = platform.node() # Get current hostname
+        self.command_history = [] # Global history (though pane history is now used)
         self.current_directory = os.getcwd()
         self.python_environment = {}
-        self.welcome_message = (
-            "pyCMD 25.0 [Version 25.0.0.0] (beta build)\n"
-            "Andrew Studios (C) All Rights Reserved\n\n"
-            "This pyCMD Program Can Cause Damage To The System!\n"
-            "Execute or search for a safe command\n\n"
-            "Use the 'View' menu to split terminal panes." # New line
-        )
+        self.welcome_message = r"""_________      _____  ________   
+______ ___.__.\_   ___ \   /     \ \______ \  
+\____ <   |  |/    \  \/  /  \ /  \ |    |  \ 
+|  |_> >___  |\     \____/    Y    \|    `   \
+|   __// ____| \______  /\____|__  /_______  /
+|__|   \/             \/         \/        \/ 
+pyCMD 25.0 [Version 25.0.1.0] (stable build)
+Andrew Studios (C) All Rights Reserved
+
+This pyCMD Program Can Cause Damage To The System!
+Execute or search for a safe command
+
+Use the 'View' menu to split terminal panes.
+""" # Removed leading spaces and initial empty line
         self.current_command_thread = None # Active command thread (global, for dialog handling)
         self.current_input_queue = None # Input queue for the active thread (global)
         self.awaiting_input = False # Global flag to know if any pane is awaiting input
         self.selected_interpreter = "cmd" # Default command interpreter selected
+
+        # Internal pyCMD variables
+        self.pycmd_variables = {
+            "PATH": os.environ.get('PATH', ''),
+            "HOME": os.path.expanduser('~'),
+            "USER": self.username,
+            "HOSTNAME": self.hostname,
+            "pyCMD_pid": str(os.getpid()),
+            "pyCMD_history": os.path.join(os.path.expanduser('~'), '.pycmd_history') # Placeholder for history file
+        }
+        self.last_command_status = 0 # Initialize $status variable
+
+        # Configuration for auto-save/load
+        self.config_dir = os.path.join(os.path.expanduser('~'), '.pycmd')
+        self.config_file = os.path.join(self.config_dir, 'config.json')
+        self.auto_session_file = os.path.join(self.config_dir, 'auto_session.session')
+        
+        self.auto_save_enabled = False
+        self.auto_load_enabled = False
+
+        # Load configuration before setting up UI to reflect saved preferences
+        self._load_config()
 
         # Then set up the UI
         self.setup_ui()
@@ -310,6 +467,9 @@ class PyCMDWindow(QMainWindow):
         
         # Show development warning
         self.show_development_warning()
+
+        # Attempt to auto-load session if enabled and file exists
+        self._auto_load_session()
         
     def apply_mica_effect(self):
         """Applies Windows 11 Mica effect to the window background"""
@@ -371,8 +531,19 @@ class PyCMDWindow(QMainWindow):
         self.tab_widget.tabBar().customContextMenuRequested.connect(self.show_tab_context_menu)
 
         self.main_layout.addWidget(self.tab_widget)
-        
-        # Create first tab
+
+        # Label for "No tabs open" message
+        self.no_tabs_message_label = QLabel(
+            "<h2 style='color: white; text-align: center;'>No tabs open.</h2>"
+            "<p style='color: white; text-align: center;'>Please go to 'File' menu and select 'New Tab' to start.</p>"
+        )
+        self.no_tabs_message_label.setAlignment(Qt.AlignCenter)
+        self.no_tabs_message_label.setStyleSheet("background-color: #202020; border-radius: 12px; padding: 20px;")
+        self.no_tabs_message_label.hide() # Initially hidden
+
+        self.main_layout.addWidget(self.no_tabs_message_label)
+
+        # Create first tab (this will be replaced if auto-load happens)
         self.create_new_tab("System Symbol")
         
         # Configure style for main elements
@@ -475,17 +646,33 @@ class PyCMDWindow(QMainWindow):
                 color: white;
                 border-radius: 10px;
             }
+            QProgressBar {
+                border: 1px solid #444;
+                border-radius: 8px;
+                background-color: rgba(25, 25, 25, 0.9);
+                text-align: center;
+                color: white;
+            }
+            QProgressBar::chunk {
+                background-color: #0078D7; /* Blue color for the chunk */
+                border-radius: 7px; /* Slightly smaller to fit inside */
+                margin: 1px; /* Small margin for chunk separation effect */
+            }
         """)
         
-    def create_new_tab(self, title="System Symbol", group_name="Default", initial_content="", initial_cwd=None, initial_interpreter=None):
-        """Creates a new tab in the application, with optional initial content and group."""
+    def create_new_tab(self, title="System Symbol", group_name="Default", initial_content="", initial_cwd=None, initial_interpreter=None, pane_data=None):
+        """Creates a new tab in the application, with optional initial content, group, and pane structure."""
+        # Hide the "no tabs open" message and show the tab widget
+        self.no_tabs_message_label.hide()
+        self.tab_widget.show()
+
         if initial_cwd is None:
             initial_cwd = self.current_directory
         if initial_interpreter is None:
             initial_interpreter = self.selected_interpreter
 
         # Prompt for tab title and group if not provided (for user-initiated new tab)
-        if title == "System Symbol" and group_name == "Default" and not initial_content:
+        if title == "System Symbol" and group_name == "Default" and not initial_content and pane_data is None:
             text, ok = QInputDialog.getText(self, "New Tab", "Enter tab title:", QLineEdit.Normal, title)
             if not ok or not text:
                 return None
@@ -502,31 +689,42 @@ class PyCMDWindow(QMainWindow):
         tab_layout.setContentsMargins(0, 0, 0, 0)
         tab_layout.setSpacing(0)
 
-        # Create a QSplitter as the main content area for the tab
-        main_splitter = QSplitter(Qt.Horizontal) # Start with horizontal split
-        tab_layout.addWidget(main_splitter)
-
-        # Create the initial terminal pane
-        initial_pane = self._create_terminal_pane()
-        initial_pane.group_name = group_name # Assign group to the pane
-        main_splitter.addWidget(initial_pane)
-        
-        # Set initial content if provided (for duplicated tabs)
-        if initial_content:
-            initial_pane.output_text.setText(initial_content)
+        if pane_data:
+            # Reconstruct panes from saved data
+            main_splitter = self._create_panes_from_data(pane_data)
+            tab_layout.addWidget(main_splitter)
+            # Find the first pane to set its group name and initial prompt
+            first_pane = self._find_first_terminal_pane(main_splitter)
+            if first_pane:
+                first_pane.group_name = group_name
+                # The content is already loaded from pane_data, just add the prompt
+                first_pane.append_output(f"\n{self._get_current_prompt()}", QColor(0, 255, 0))
+                first_pane.command_entry.setFocus()
+        else:
+            # Create a single initial terminal pane if no pane_data
+            main_splitter = QSplitter(Qt.Horizontal)
+            tab_layout.addWidget(main_splitter)
+            initial_pane = self._create_terminal_pane()
+            initial_pane.group_name = group_name
+            main_splitter.addWidget(initial_pane)
+            
+            if initial_content:
+                initial_pane.output_text.setText(initial_content)
+            else:
+                initial_pane.output_text.setText(self.welcome_message)
+            
+            initial_pane.append_output(f"\n{self._get_current_prompt()}", QColor(0, 255, 0))
+            initial_pane.command_entry.setFocus()
         
         # Add tab with group name prefix
         full_tab_title = f"[{group_name}] {title}" if group_name != "Default" else title
         tab_index = self.tab_widget.addTab(tab, full_tab_title)
         self.tab_widget.setCurrentIndex(tab_index)
         
-        # Set welcome message for the initial pane if no initial content was provided
-        if not initial_content:
-            initial_pane.output_text.setText(self.welcome_message) 
+        # Auto-save after creating a new tab
+        if self.auto_save_enabled:
+            self._auto_save_session_silent()
 
-        # Set focus on the initial pane's command entry
-        initial_pane.command_entry.setFocus()
-        
         return tab
 
     def _create_terminal_pane(self):
@@ -561,6 +759,7 @@ class PyCMDWindow(QMainWindow):
         focused_pane = self._get_focused_terminal_pane(current_widget)
         if focused_pane:
             focused_pane.append_output(f"Interpreter set to: {self.selected_interpreter.upper()}\n", QColor(0, 255, 255)) # Light blue
+            focused_pane.append_output(f"{self._get_current_prompt()}", QColor(0, 255, 0)) # Display new prompt
         else:
             # Fallback if no pane is focused (e.g., on initial load)
             self.show_native_message("Interpreter Change", f"Interpreter set to: {self.selected_interpreter.upper()}")
@@ -568,7 +767,6 @@ class PyCMDWindow(QMainWindow):
     def handle_command_input(self, pane_instance):
         """Handles user input from a specific pane's QLineEdit."""
         command_entry = pane_instance.command_entry
-        output_text = pane_instance.output_text
         user_input = command_entry.text().strip()
         
         # If the specific pane is awaiting input, send it to its thread
@@ -579,11 +777,15 @@ class PyCMDWindow(QMainWindow):
             command_entry.setPlaceholderText("Enter command...")
             command_entry.setEnabled(True)
         else:
+            # Echo the user's typed command to the output area
+            pane_instance.append_output(f"{self._get_current_prompt()}{user_input}\n", QColor(255, 255, 255))
             # If not awaiting input, execute a new command in THIS pane
             self.execute_command_in_pane(pane_instance, user_input)
         
         command_entry.clear()
-        output_text.moveCursor(QTextCursor.End)
+        # The prompt is now added by command_thread_finished for external commands,
+        # or by internal commands themselves.
+        pane_instance.output_text.moveCursor(QTextCursor.End)
 
     def show_tab_context_menu(self, pos):
         """Shows the context menu for tabs (native style)"""
@@ -620,15 +822,16 @@ class PyCMDWindow(QMainWindow):
             menu.exec(self.tab_widget.mapToGlobal(pos))
     
     def close_tab(self, index):
-        """Closes a tab"""
-        if self.tab_widget.count() > 1:
-            widget = self.tab_widget.widget(index)
-            # Recursively stop all threads in all panes within this tab
-            self._stop_all_pane_threads(widget)
-            self.tab_widget.removeTab(index)
-        else:
-            QMessageBox.warning(self, "Warning", "At least one tab must remain open.")
+        """Closes a tab. If it's the last tab, displays a message."""
+        widget = self.tab_widget.widget(index)
+        # Recursively stop all threads in all panes within this tab
+        self._stop_all_pane_threads(widget)
+        self.tab_widget.removeTab(index)
 
+        if self.tab_widget.count() == 0:
+            self.tab_widget.hide()
+            self.no_tabs_message_label.show()
+        
     def closeEvent(self, event):
         """Overrides the close event to ask for confirmation before exiting."""
         reply = QMessageBox.question(
@@ -691,7 +894,7 @@ class PyCMDWindow(QMainWindow):
 
         # Dialog for new group
         new_group, ok = QInputDialog.getText(
-            self, "Rename Tab Group", "Enter new group name:",
+            self, "New Tab Group", "Enter new group name:",
             QLineEdit.Normal, current_group
         )
         if not ok or not new_group:
@@ -705,43 +908,43 @@ class PyCMDWindow(QMainWindow):
         full_new_title = f"[{new_group}] {new_title}" if new_group != "Default" else new_title
         self.tab_widget.setTabText(index, full_new_title)
 
-    def duplicate_tab(self, index):
-        """Duplicates the selected tab."""
-        source_widget = self.tab_widget.widget(index)
-        
-        # Get the primary pane from the source tab
-        main_splitter = source_widget.layout().itemAt(0).widget()
-        if isinstance(main_splitter, QSplitter):
-            source_pane = main_splitter.widget(0)
-        else:
-            source_pane = source_widget.findChild(TerminalPane)
-            if not source_pane:
-                self.show_native_message("Duplication Error", "Could not find a terminal pane to duplicate.", QMessageBox.Critical)
-                return
+        # Auto-save after renaming a tab
+        if self.auto_save_enabled:
+            self._auto_save_session_silent()
 
-        # Extract data from the source pane
-        source_title = self.tab_widget.tabText(index)
-        # Remove group prefix from title for duplication
-        title_match = re.match(r'\[(.*?)\]\s*(.*)', source_title)
+    def duplicate_tab(self, index):
+        """Duplicates the selected tab, preserving its content, colors, and split layout."""
+        source_tab_widget = self.tab_widget.widget(index)
+        source_tab_title = self.tab_widget.tabText(index)
+
+        # Extract original title and group
+        title_match = re.match(r'\[(.*?)\]\s*(.*)', source_tab_title)
         if title_match:
+            source_group = title_match.group(1)
             base_title = title_match.group(2)
         else:
-            base_title = source_title
+            source_group = "Default"
+            base_title = source_tab_title
 
-        source_content = source_pane.output_text.toPlainText()
-        source_cwd = self.current_directory # Assuming CWD is global for now
-        source_interpreter = self.selected_interpreter # Assuming interpreter is global for now
-        source_group = source_pane.group_name
+        # Get the structured data of the source tab's layout
+        main_splitter = source_tab_widget.layout().itemAt(0).widget()
+        if not isinstance(main_splitter, QSplitter):
+            self.show_native_message("Duplication Error", "Could not find main splitter in source tab.", QMessageBox.Critical)
+            return
+        
+        pane_data = self._get_pane_data(main_splitter)
 
-        # Create a new tab with duplicated content and properties
+        # Create a new tab using the extracted structured data
         new_tab_title = f"Copied - {base_title}"
         self.create_new_tab(
             title=new_tab_title,
             group_name=source_group,
-            initial_content=source_content,
-            initial_cwd=source_cwd,
-            initial_interpreter=source_interpreter
+            pane_data=pane_data # Pass the structured pane data
         )
+        # Auto-save after duplicating a tab (already handled by create_new_tab, but explicitly for clarity)
+        # if self.auto_save_enabled:
+        #     self._auto_save_session_silent()
+
 
     def show_native_message(self, title, message, icon=QMessageBox.Information):
         """Shows a message with native style"""
@@ -759,26 +962,42 @@ class PyCMDWindow(QMainWindow):
     def show_changelog(self):
         """Shows the changelog with native style and better formatting"""
         changelog = """
-        <b>pyCMD 25.0.0.0 Changelog:</b>
+        <b>pyCMD 25.0.1.0 Changelog:</b>
         <ul>
-            <li>New UI</li>
-            <li>Better Tabs (Rounded and Movable)</li>
-            <li>Better Messagebox</li>
-            <li>Better Textbox</li>
-            <li><b>Interactive CMD Output (Dialog for Prompts)</b></li>
-            <li><b>Optimized Command Execution (Background Process)</b></li>
-            <li><b>Administrator Mode (Windows UAC Integration)</b></li>
-            <li><b>Open files via command line argument</b></li>
-            <li><b>Interpreter Selection (CMD/PowerShell/pyCMD)</b></li>
-            <li><b>Split Terminal Functionality (Horizontal/Vertical)</b></li>
-            <li><b>Floating Tab Style</b></li>
-            <li><b>Tab Groups (Conceptual)</b></li>
-            <li><b>Duplicate Tab Functionality</b></li>
-            <li>And More</li>
+            <li><b>Improved Session Management:</b>
+                <ul>
+                    <li>**Auto Session & Auto Load Session:** New functionality to automatically save and load the last session.</li>
+                    <li>**Save Session:** Significant improvement in the ability to save the current session's configuration.</li>
+                </ul>
+            </li>
+            <li><b>User Interface & Usability Enhancements:</b>
+                <ul>
+                    <li>**Improved Tab Duplication:** The process of duplicating tabs is now more efficient and robust.</li>
+                    <li>**"No Tabs Open" Message:** A clear message is displayed when all tabs are closed, guiding the user to open a new one.</li>
+                    <li>**Set pyCMD as Default:** Option to set pyCMD as the default program for certain file types.</li>
+                    <li>**ProgressBar in Command Execution:** A progress bar is now displayed when running commands, providing visual feedback.</li>
+                    <li>**Enhanced Help Window:** More detailed and useful information available in the help window.</li>
+                </ul>
+            </li>
+            <li><b>Enhanced Compatibility & Emulation:</b>
+                <ul>
+                    <li>**ANSI Compatibility:** Improved support for ANSI escape sequences for richer display.</li>
+                    <li>**Major pyCMD Interpreter Improvement:** Significant advancements in the capability and stability of the internal pyCMD interpreter.</li>
+                    <li>**Improved Emulation & Colors:** More authentic terminal emulation experience with better color support.</li>
+                    <li>**Improved Python Traceback Display:** Internal Python errors now show full tracebacks in the terminal output.</li>
+                    <li>**Direct File Opening:** pyCMD.exe can now directly open files with `.rcmd`, `.sh`, `.bat`, `.sessions`, and `.vbs` extensions.</li>
+                    <li>**Enhanced Command Emulation:** The current working directory is now displayed as a prompt before each command for a more authentic terminal experience.</li>
+                </ul>
+            </li>
+            <li><b>Performance & Optimization:</b>
+                <ul>
+                    <li>**General Optimization:** Improvements in application performance and efficiency.</li>
+                </ul>
+            </li>
         </ul>
         """
         self.show_native_message("pyCMD Changelog", changelog, QMessageBox.Information)
-    
+
     def show_about(self):
         """Shows 'About' information with native style and better formatting"""
         msg = QMessageBox(self)
@@ -791,7 +1010,7 @@ class PyCMDWindow(QMainWindow):
             <p><i>Advanced Command Line Interface</i></p>
             <hr>
             <p>Created by <b>Andrew Studios</b></p>
-            <p>Version 25.0.0.0 (Stable Build)</p>
+            <p>Version 25.0.1.0 (Stable Build)</p>
             <p>© 2025 All Rights Reserved</p>
             <hr>
             <p style='font-size: small;'>
@@ -810,18 +1029,21 @@ class PyCMDWindow(QMainWindow):
         
         msg.exec()
     
+    def _get_current_prompt(self):
+        """Generates the dynamic prompt string."""
+        return f"{self.username}@{self.hostname}:{self.current_directory}> "
+
     def execute_command_in_pane(self, pane_instance, command):
         """Executes a command within a specific TerminalPane."""
         output_text = pane_instance.output_text
-        command_entry = pane_instance.command_entry
 
         if not command:
+            # If command is empty, just add a new prompt
+            pane_instance.append_output(f"{self._get_current_prompt()}", QColor(0, 255, 0))
             return
         
-        self.command_history.append(command)
-        # Add a new line after the command so output starts on a new line
-        pane_instance.append_output(f"> {command}\n", QColor(255, 255, 255)) # Use pane_instance.append_output for consistency
-        
+        # History is now managed by TerminalPane.keyPressEvent
+
         # Stop any previous command thread for THIS pane
         if pane_instance.command_thread and pane_instance.command_thread.isRunning():
             pane_instance.stop_pane_thread()
@@ -829,54 +1051,139 @@ class PyCMDWindow(QMainWindow):
         # Flag to check if an internal pyCMD command was handled
         command_handled_internally = False
 
-        # Custom pyCMD commands (these are always handled internally)
-        if command.lower().startswith("pycmd echocolor="):
-            self.handle_echocolor(command, pane_instance) # Pass pane_instance
-            command_handled_internally = True
-        elif command.lower() == "cls":
-            output_text.clear()
-            output_text.setText(self.welcome_message)
-            command_handled_internally = True
-        elif command.lower() == "help":
-            self.show_help()
-            command_handled_internally = True
-        elif command.lower().startswith("cd "):
-            self.change_directory(command, pane_instance) # Pass pane_instance
-            command_handled_internally = True
-        elif command.lower() == "pycmd save":
-            self.save_session()
-            command_handled_internally = True
-        elif command.lower() == "pycmd open":
-            self.open_session()
-            command_handled_internally = True
-        elif command.lower() == "pycmd create rcmd":
-            self.create_rcmd_command()
-            command_handled_internally = True
-        elif command.lower() == "pycmd modify rcmd": # Handle internal command
-            self.modify_rcmd_command()
-            command_handled_internally = True
-        elif command.lower() == "pycmd rcmd":
-            self.execute_rcmd_file()
-            command_handled_internally = True
-        elif command.lower() == "pycmd admin_only_command": # Example of an admin-only command
-            if self.is_admin_mode:
-                pane_instance.append_output("<span style='color: yellow;'>[ADMIN MODE] Executing sensitive operation...</span>\n", QColor(255, 255, 0))
-                # Admin command logic would go here
-            else:
-                pane_instance.append_output("<span style='color: red;'>Access Denied: This command requires Administrator privileges.</span>\n", QColor(255, 0, 0))
-            command_handled_internally = True
-        
-        # If the command was not handled by an internal pyCMD command
-        if not command_handled_internally:
-            if self.selected_interpreter == "pycmd":
-                # If "pyCMD" interpreter is selected and it's not a recognized internal command
-                pane_instance.append_output(f"Error: Unrecognized pyCMD internal command: '{command}'\n", QColor(255, 0, 0))
-            else:
-                # If "Windows CMD" or "PowerShell" interpreter is selected, execute via subprocess
-                pane_instance.start_command_execution(command, self.current_directory, self.selected_interpreter)
+        try: # Wrap internal command handling in a try-except for traceback
+            # Custom pyCMD commands (these are always handled internally)
+            if command.lower().startswith("pycmd echocolor="):
+                self.handle_echocolor(command, pane_instance) # Pass pane_instance
+                command_handled_internally = True
+            elif command.lower() == "cls":
+                output_text.clear()
+                output_text.setText(self.welcome_message)
+                pane_instance.append_output(f"\n{self._get_current_prompt()}", QColor(0, 255, 0)) # Add prompt immediately
+                command_handled_internally = True
+            elif command.lower() == "help":
+                self.show_help()
+                command_handled_internally = True
+            elif command.lower().startswith("cd "):
+                self.change_directory(command, pane_instance) # Pass pane_instance
+                command_handled_internally = True
+            elif command.lower() == "pycmd save":
+                self.save_session()
+                command_handled_internally = True
+            elif command.lower() == "pycmd open":
+                self.open_session()
+                command_handled_internally = True
+            elif command.lower() == "pycmd create rcmd":
+                self.create_rcmd_command()
+                command_handled_internally = True
+            elif command.lower() == "pycmd modify rcmd": # Handle internal command
+                self.modify_rcmd_command()
+                command_handled_internally = True
+            elif command.lower() == "pycmd rcmd":
+                self.execute_rcmd_file(pane_instance) # Pass pane_instance here
+                command_handled_internally = True
+            elif command.lower() == "pycmd admin_only_command": # Example of an admin-only command
+                if self.is_admin_mode:
+                    pane_instance.append_output("<span style='color: yellow;'>[ADMIN MODE] Executing sensitive operation...</span>\n", QColor(255, 255, 0))
+                    # Admin command logic would go here
+                else:
+                    pane_instance.append_output("<span style='color: red;'>Access Denied: This command requires Administrator privileges.</span>\n", QColor(255, 0, 0))
+                command_handled_internally = True
+            elif command.lower() == "pycmd systeminfo": # New systeminfo command
+                self._handle_systeminfo(pane_instance)
+                command_handled_internally = True
+            elif command.lower() == "ls": # New ls command
+                self._handle_ls(pane_instance)
+                command_handled_internally = True
+            elif command.lower().startswith("set "): # New set command
+                self._handle_set_command(command, pane_instance)
+                command_handled_internally = True
+            elif command.lower().startswith("echo "): # Enhanced echo command
+                self._handle_echo_command(command, pane_instance)
+                command_handled_internally = True
+            elif command.lower() == "pwd": # New pwd command
+                self._handle_pwd_command(pane_instance)
+                command_handled_internally = True
+            elif command.lower().startswith("open "): # New open command
+                self._handle_open_command(command, pane_instance)
+                command_handled_internally = True
+            elif command.lower().startswith("math "): # New math command
+                self._handle_math_command(command, pane_instance)
+                command_handled_internally = True
+            elif command.lower().startswith("read "): # New read command
+                self._handle_read_command(command, pane_instance)
+                command_handled_internally = True
+            elif command.lower().startswith("type "): # New type command
+                self._handle_type_command(command, pane_instance)
+                command_handled_internally = True
+            # Handle "python" as an external command if not in "pycmd" interpreter mode
+            elif command.lower().startswith("python ") or command.lower() == "python":
+                if self.selected_interpreter == "pycmd":
+                    # If in pyCMD interpreter mode, treat "python" as an internal Python code execution
+                    # This is for executing Python *snippets* directly within pyCMD's context
+                    self.execute_python_code(command, pane_instance) # Pass pane_instance directly
+                    command_handled_internally = True
+                else:
+                    # If in CMD or PowerShell mode, treat "python" as an external executable
+                    # This will run the system's python.exe
+                    if self.selected_interpreter == "cmd":
+                        command_args = ["cmd.exe", "/c", command]
+                    elif self.selected_interpreter == "powershell":
+                        command_args = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command]
+                    else:
+                        command_args = [command] # Fallback
+                    pane_instance.start_command_execution(command_args, self.current_directory, self.selected_interpreter)
+                    command_handled_internally = True
+            elif command.lower().startswith("pycmd autosave "):
+                state = command[len("pycmd autosave "):].strip().lower()
+                if state == "on":
+                    self.toggle_auto_save(True)
+                    pane_instance.append_output("Auto Save Session: ON\n", QColor(0, 255, 0))
+                elif state == "off":
+                    self.toggle_auto_save(False)
+                    pane_instance.append_output("Auto Save Session: OFF\n", QColor(255, 255, 0))
+                else:
+                    pane_instance.append_output("Error: Invalid argument for pycmd autosave. Use 'on' or 'off'.\n", QColor(255, 0, 0))
+                command_handled_internally = True
+            elif command.lower().startswith("pycmd autoload "):
+                state = command[len("pycmd autoload "):].strip().lower()
+                if state == "on":
+                    self.toggle_auto_load(True)
+                    pane_instance.append_output("Auto Load Session: ON\n", QColor(0, 255, 0))
+                elif state == "off":
+                    self.toggle_auto_load(False)
+                    pane_instance.append_output("Auto Load Session: OFF\n", QColor(255, 255, 0))
+                else:
+                    pane_instance.append_output("Error: Invalid argument for pycmd autoload. Use 'on' or 'off'.\n", QColor(255, 0, 0))
+                command_handled_internally = True
+            elif command.lower() == "pycmd autosave_now":
+                self._auto_save_session_silent()
+                pane_instance.append_output("Session auto-saved silently.\n", QColor(0, 255, 0))
+                command_handled_internally = True
+            
+            # If the command was not handled by an internal pyCMD command (and not a python command)
+            if not command_handled_internally:
+                if self.selected_interpreter == "pycmd":
+                    pane_instance.append_output(f"Error: Unrecognized pyCMD internal command: '{command}'\n", QColor(255, 0, 0))
+                    pane_instance.append_output(f"{self._get_current_prompt()}", QColor(0, 255, 0)) # Add prompt
+                else:
+                    # Execute via subprocess for CMD or PowerShell commands
+                    if self.selected_interpreter == "cmd":
+                        command_args = ["cmd.exe", "/c", command]
+                    elif self.selected_interpreter == "powershell":
+                        command_args = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command]
+                    else:
+                        command_args = [command] # Fallback, though should be covered by interpreter check
+
+                    pane_instance.start_command_execution(command_args, self.current_directory, self.selected_interpreter)
+                    # Prompt will be added by command_thread_finished for external commands
+
+        except Exception:
+            # Catch any Python errors in internal commands and print traceback
+            pane_instance.append_output(f"An internal pyCMD error occurred:\n{traceback.format_exc()}\n", QColor(255, 0, 0))
+            pane_instance.append_output(f"{self._get_current_prompt()}", QColor(0, 255, 0)) # Add prompt
 
         output_text.moveCursor(QTextCursor.End)
-        command_entry.clear()
     
     def append_output(self, text, color, pane_instance): # Now takes pane_instance
         """Appends text to a specific pane's QTextEdit with the specified color."""
@@ -891,8 +1198,13 @@ class PyCMDWindow(QMainWindow):
         # Show the prompt in the pane's main text area
         pane_instance.append_output(f"<span style='color: yellow;'>{prompt_text}</span>\n", QColor(255, 255, 0))
         
+        dialog_title = "Command Input Required"
+        if ">>>" in prompt_text: # Simple heuristic for Python interactive prompt
+            dialog_title = "Python Interactive Input"
+            prompt_text += "\n(Type 'exit()' or 'quit()' to leave Python interactive mode)"
+
         user_input, ok = QInputDialog.getText(
-            self, "Command Input Required", prompt_text, QLineEdit.Normal, ""
+            self, dialog_title, prompt_text, QLineEdit.Normal, ""
         )
         
         if ok and user_input is not None:
@@ -912,12 +1224,18 @@ class PyCMDWindow(QMainWindow):
     
     def command_thread_finished(self, return_code, pane_instance): # Now takes pane_instance
         """Called when a command thread finishes for a specific pane."""
+        self.last_command_status = return_code # Update $status
         pane_instance.append_output(f"\nCommand finished with exit code {return_code}\n", QColor(100, 100, 255))
         pane_instance.stop_pane_thread() # Clean up thread for this pane
         pane_instance.command_entry.setPlaceholderText("Enter command...")
         pane_instance.command_entry.setEnabled(True)
         pane_instance.command_entry.setFocus()
+        pane_instance.append_output(f"{self._get_current_prompt()}", QColor(0, 255, 0)) # Add new prompt
         pane_instance.output_text.moveCursor(QTextCursor.End)
+
+        # Trigger auto-save if enabled
+        if self.auto_save_enabled:
+            self._auto_save_session_silent()
 
     def handle_echocolor(self, command, pane_instance): # Changed to take pane_instance
         """Handles the custom echocolor command"""
@@ -955,9 +1273,14 @@ class PyCMDWindow(QMainWindow):
                     pane_instance.append_output(f"Valid colors: {', '.join(color_map.keys())}\n", QColor(255, 255, 255)) # Use pane_instance.append_output
             else:
                 pane_instance.append_output("Error: Invalid command format. Use pyCMD echocolor=(*color*)=(\"*text*\")\n", QColor(255, 0, 0)) # Use pane_instance.append_output
-        except Exception as e:
-            pane_instance.append_output(f"Error executing echocolor command: {e}\n", QColor(255, 0, 0)) # Use pane_instance.append_output
-    
+            self.last_command_status = 0 # Assuming echocolor itself doesn't fail unless format is wrong
+        except Exception:
+            # Catch any Python errors in internal commands and print traceback
+            pane_instance.append_output(f"An internal pyCMD error occurred in echocolor:\n{traceback.format_exc()}\n", QColor(255, 0, 0))
+            self.last_command_status = 1
+        finally:
+            pane_instance.append_output(f"{self._get_current_prompt()}", QColor(0, 255, 0)) # Add prompt
+
     def change_directory(self, command, pane_instance): # Changed to take pane_instance
         """Changes the current directory"""
         new_directory = command[3:].strip()
@@ -965,12 +1288,16 @@ class PyCMDWindow(QMainWindow):
             os.chdir(new_directory)
             self.current_directory = os.getcwd()
             pane_instance.append_output(f"Directory changed to {self.current_directory}\n", QColor(0, 255, 0)) # Use pane_instance.append_output
-        except Exception as e:
-            pane_instance.append_output(f"Error: {e}\n", QColor(255, 0, 0)) # Use pane_instance.append_output
-            self.show_native_message("Error", f"Error: {e}", QMessageBox.Critical)
+            self.last_command_status = 0
+        except Exception:
+            pane_instance.append_output(f"Error changing directory:\n{traceback.format_exc()}\n", QColor(255, 0, 0)) # Use pane_instance.append_output
+            self.show_native_message("Error", f"Error changing directory: {traceback.format_exc()}", QMessageBox.Critical)
+            self.last_command_status = 1
+        finally:
+            pane_instance.append_output(f"{self._get_current_prompt()}", QColor(0, 255, 0)) # Add prompt
         
-    def execute_python_code(self, command, output_text):
-        """Executes Python code entered by the user"""
+    def execute_python_code(self, command, pane_instance): # Changed to take pane_instance
+        """Executes Python code entered by the user (for pyCMD interpreter mode)"""
         old_stdout = sys.stdout
         old_stderr = sys.stderr
         new_stdout = StringIO()
@@ -980,21 +1307,262 @@ class PyCMDWindow(QMainWindow):
 
         try:
             # Handle 'python ' prefix for Python commands
-            code_to_execute = command[7:].strip() if command.lower().startswith("python ") else command.strip()
-            exec(code_to_execute, self.python_environment)
+            # If command is just "python", treat as empty code (no output)
+            code_to_execute = command[7:].strip() if command.lower().startswith("python ") else ""
+            
+            if code_to_execute:
+                exec(code_to_execute, self.python_environment)
+            
             output = new_stdout.getvalue()
             error = new_stderr.getvalue()
+            
             if output:
-                output_text.append(output, QColor(255, 255, 255))
+                pane_instance.append_output(output, QColor(255, 255, 255)) # Use pane_instance.append_output
             if error:
-                output_text.append("Error: " + error, QColor(255, 0, 0))
-        except Exception as e:
-            output_text.append(f"Error executing Python code: {e}\n", QColor(255, 0, 0))
-            self.show_native_message("Python Execution Error", f"Error executing Python code: {e}", QMessageBox.Critical)
+                pane_instance.append_output("Error: " + error, QColor(255, 0, 0)) # Use pane_instance.append_output
+            self.last_command_status = 0
+        except Exception:
+            pane_instance.append_output(f"Error executing Python code:\n{traceback.format_exc()}\n", QColor(255, 0, 0)) # Use pane_instance.append_output
+            self.show_native_message("Python Execution Error", f"Error executing Python code: {traceback.format_exc()}", QMessageBox.Critical)
+            self.last_command_status = 1
         finally:
             sys.stdout = old_stdout
             sys.stderr = old_stderr
+            pane_instance.append_output(f"{self._get_current_prompt()}", QColor(0, 255, 0)) # Add prompt
+    
+    def _handle_systeminfo(self, pane_instance):
+        """Displays system information."""
+        info = []
+        info.append("--- System Information ---")
+        info.append(f"Operating System: {platform.system()} {platform.release()} ({platform.version()})")
+        info.append(f"Architecture: {platform.machine()}")
+        info.append(f"Processor: {platform.processor()}")
+        info.append(f"Python Version (pyCMD internal): {platform.python_version()}")
+        info.append(f"Current Directory: {self.current_directory}")
+        info.append(f"User: {self.username}")
+        info.append(f"Hostname: {self.hostname}")
+        info.append("--------------------------")
+        pane_instance.append_output("\n".join(info) + "\n", QColor(128, 255, 255)) # Light Cyan
+        self.last_command_status = 0
+        pane_instance.append_output(f"{self._get_current_prompt()}", QColor(0, 255, 0)) # Add prompt
+
+    def _handle_ls(self, pane_instance):
+        """Lists directory contents (for pyCMD interpreter mode)."""
+        try:
+            items = os.listdir(self.current_directory)
+            
+            # Sort items: directories first, then files, both alphabetically
+            items.sort(key=lambda x: (not os.path.isdir(os.path.join(self.current_directory, x)), x.lower()))
+
+            html_output = ""
+            
+            for item in items:
+                full_path = os.path.join(self.current_directory, item)
+                display_name = item
+                color_hex = "#FFFFFF" # Default white for files
+
+                if os.path.isdir(full_path):
+                    display_name += "/" # Append slash for directories
+                    color_hex = "#80FFFF" # Light cyan for directories
+                elif os.path.isfile(full_path) and os.access(full_path, os.X_OK):
+                    color_hex = "#00FF00" # Green for executable files (basic check)
+
+                html_output += f"<span style='color:{color_hex};'>{display_name}</span><br>"
+            
+            pane_instance.output_text.insertHtml(html_output)
+            self.last_command_status = 0
+
+        except Exception:
+            pane_instance.append_output(f"Error listing directory: {traceback.format_exc()}\n", QColor(255, 0, 0))
+            self.show_native_message("Error", f"Error listing directory: {traceback.format_exc()}", QMessageBox.Critical)
+            self.last_command_status = 1
+        finally:
+            pane_instance.append_output(f"{self._get_current_prompt()}", QColor(0, 255, 0)) # Add prompt
+
+    def _handle_set_command(self, command, pane_instance):
+        """Handles the 'set' command for internal pyCMD variables."""
+        parts = command.split(' ', 1) # Split into 'set' and the rest
+        if len(parts) == 1: # Just 'set' - list all variables
+            pane_instance.append_output("--- pyCMD Variables ---\n", QColor(255, 255, 0))
+            # Include standard variables and custom ones
+            all_vars = {**self.pycmd_variables, "$status": str(self.last_command_status)}
+            for key, value in all_vars.items():
+                pane_instance.append_output(f"{key}={value}\n", QColor(255, 255, 255))
+            pane_instance.append_output("-----------------------\n", QColor(255, 255, 0))
+            self.last_command_status = 0
+        else:
+            arg = parts[1].strip()
+            if '=' in arg: # set <var_name>=<value>
+                var_name, value = arg.split('=', 1)
+                self.pycmd_variables[var_name.upper()] = value # Store in uppercase for consistency
+                pane_instance.append_output(f"Variable '{var_name.upper()}' set to '{value}'\n", QColor(0, 255, 0))
+                self.last_command_status = 0
+            else: # set <var_name> - display value
+                var_name = arg.upper()
+                if var_name == "STATUS": # Special case for $status
+                    pane_instance.append_output(f"STATUS={self.last_command_status}\n", QColor(255, 255, 255))
+                    self.last_command_status = 0
+                elif var_name in self.pycmd_variables:
+                    pane_instance.append_output(f"{var_name}={self.pycmd_variables[var_name]}\n", QColor(255, 255, 255))
+                    self.last_command_status = 0
+                else:
+                    pane_instance.append_output(f"Error: Variable '{var_name}' not found.\n", QColor(255, 0, 0))
+                    self.last_command_status = 1
+        pane_instance.append_output(f"{self._get_current_prompt()}", QColor(0, 255, 0)) # Add prompt
+
+    def _handle_echo_command(self, command, pane_instance):
+        """Handles the 'echo' command, expanding variables."""
+        text_to_echo = command[len("echo"):].strip()
         
+        # Simple variable expansion: find $VAR_NAME and replace
+        # This regex looks for $ followed by alphanumeric characters or underscore
+        def replace_var(match):
+            var_name = match.group(1).upper() # Convert to uppercase for lookup
+            if var_name == "STATUS":
+                return str(self.last_command_status)
+            return self.pycmd_variables.get(var_name, f"${match.group(1)}") # Return original if not found
+
+        expanded_text = re.sub(r'\$([a-zA-Z0-9_]+)', replace_var, text_to_echo)
+        
+        pane_instance.append_output(expanded_text + "\n", QColor(255, 255, 255))
+        self.last_command_status = 0
+        pane_instance.append_output(f"{self._get_current_prompt()}", QColor(0, 255, 0)) # Add prompt
+
+    def _handle_pwd_command(self, pane_instance):
+        """Handles the 'pwd' command."""
+        pane_instance.append_output(self.current_directory + "\n", QColor(255, 255, 255))
+        self.last_command_status = 0
+        pane_instance.append_output(f"{self._get_current_prompt()}", QColor(0, 255, 0)) # Add prompt
+
+    def _handle_open_command(self, command, pane_instance):
+        """Handles the 'open' command to open a file with its default application."""
+        file_path = command[len("open"):].strip()
+        if not file_path:
+            pane_instance.append_output("Error: 'open' command requires a file path.\n", QColor(255, 0, 0))
+            self.last_command_status = 1
+            pane_instance.append_output(f"{self._get_current_prompt()}", QColor(0, 255, 0))
+            return
+
+        full_path = os.path.join(self.current_directory, file_path)
+        
+        if not os.path.exists(full_path):
+            pane_instance.append_output(f"Error: File not found: '{full_path}'\n", QColor(255, 0, 0))
+            self.last_command_status = 1
+            pane_instance.append_output(f"{self._get_current_prompt()}", QColor(0, 255, 0))
+            return
+
+        try:
+            if platform.system() == "Windows":
+                os.startfile(full_path)
+            elif platform.system() == "Darwin": # macOS
+                subprocess.run(['open', full_path], check=True)
+            else: # Linux and other Unix-like
+                subprocess.run(['xdg-open', full_path], check=True)
+            pane_instance.append_output(f"Opened '{full_path}' with default application.\n", QColor(0, 255, 0))
+            self.last_command_status = 0
+        except Exception as e:
+            pane_instance.append_output(f"Error opening file '{full_path}': {e}\n", QColor(255, 0, 0))
+            self.show_native_message("Error Opening File", f"Error opening file: {e}", QMessageBox.Critical)
+            self.last_command_status = 1
+        finally:
+            pane_instance.append_output(f"{self._get_current_prompt()}", QColor(0, 255, 0))
+
+    def _handle_math_command(self, command, pane_instance):
+        """Handles the 'math' command for basic arithmetic evaluation."""
+        expression = command[len("math"):].strip()
+        if not expression:
+            pane_instance.append_output("Error: 'math' command requires an expression.\n", QColor(255, 0, 0))
+            self.last_command_status = 1
+            pane_instance.append_output(f"{self._get_current_prompt()}", QColor(0, 255, 0))
+            return
+
+        try:
+            # Basic security for eval: limit globals and builtins
+            # Only allow a safe subset of operations
+            safe_dict = {
+                '__builtins__': {
+                    'abs': abs, 'max': max, 'min': min, 'round': round,
+                    'sum': sum, 'len': len, 'int': int, 'float': float,
+                    'str': str, 'bool': bool
+                },
+                'True': True, 'False': False, 'None': None
+            }
+            result = eval(expression, {"__builtins__": safe_dict['__builtins__']}, safe_dict)
+            pane_instance.append_output(f"{result}\n", QColor(255, 255, 255))
+            self.last_command_status = 0
+        except Exception as e:
+            pane_instance.append_output(f"Error evaluating math expression: {e}\n", QColor(255, 0, 0))
+            self.last_command_status = 1
+        finally:
+            pane_instance.append_output(f"{self._get_current_prompt()}", QColor(0, 255, 0))
+
+    def _handle_read_command(self, command, pane_instance):
+        """Handles the 'read' command to read input into a variable."""
+        parts = command.split(' ', 1)
+        if len(parts) < 2:
+            pane_instance.append_output("Error: 'read' command requires a variable name.\nUsage: read <variable_name>\n", QColor(255, 0, 0))
+            self.last_command_status = 1
+            pane_instance.append_output(f"{self._get_current_prompt()}", QColor(0, 255, 0))
+            return
+        
+        var_name = parts[1].strip().upper() # Convert to uppercase for internal storage
+
+        user_input, ok = QInputDialog.getText(
+            self, "Read Input", f"Enter value for '{var_name}':", QLineEdit.Normal, ""
+        )
+        
+        if ok:
+            self.pycmd_variables[var_name] = user_input
+            pane_instance.append_output(f"Variable '{var_name}' set to '{user_input}'\n", QColor(0, 255, 0))
+            self.last_command_status = 0
+        else:
+            pane_instance.append_output(f"Read operation cancelled.\n", QColor(255, 255, 0))
+            self.last_command_status = 1
+            
+        pane_instance.append_output(f"{self._get_current_prompt()}", QColor(0, 255, 0))
+
+    def _handle_type_command(self, command, pane_instance):
+        """Handles the 'type' command to indicate how a command would be interpreted."""
+        cmd_to_type = command[len("type"):].strip()
+        if not cmd_to_type:
+            pane_instance.append_output("Error: 'type' command requires a command name.\n", QColor(255, 0, 0))
+            self.last_command_status = 1
+            pane_instance.append_output(f"{self._get_current_prompt()}", QColor(0, 255, 0))
+            return
+
+        internal_commands = [
+            "cls", "help", "ls", "pycmd", "cd", "set", "echo", "pwd",
+            "open", "math", "read", "type", "python" # 'python' is internal in pyCMD mode
+        ]
+        
+        if cmd_to_type.lower() in internal_commands:
+            pane_instance.append_output(f"{cmd_to_type} is a pyCMD internal command.\n", QColor(0, 255, 0))
+            self.last_command_status = 0
+        elif self.selected_interpreter != "pycmd":
+            # Check if it's a system executable in CMD/PowerShell mode
+            try:
+                # Use 'where' on Windows, 'which' on Linux/macOS
+                check_cmd = "where" if platform.system() == "Windows" else "which"
+                result = subprocess.run([check_cmd, cmd_to_type], capture_output=True, text=True, check=False, shell=False)
+                if result.returncode == 0:
+                    pane_instance.append_output(f"{cmd_to_type} is a system executable: {result.stdout.strip()}\n", QColor(0, 255, 0))
+                    self.last_command_status = 0
+                else:
+                    pane_instance.append_output(f"{cmd_to_type} is not found as an internal or system command.\n", QColor(255, 255, 0))
+                    self.last_command_status = 1
+            except FileNotFoundError:
+                pane_instance.append_output(f"Error: '{check_cmd}' command not found. Cannot determine type of '{cmd_to_type}'.\n", QColor(255, 0, 0))
+                self.last_command_status = 1
+            except Exception as e:
+                pane_instance.append_output(f"An error occurred while checking command type: {e}\n", QColor(255, 0, 0))
+                self.last_command_status = 1
+        else: # pyCMD mode, and not an internal command
+            pane_instance.append_output(f"{cmd_to_type} is not found as a pyCMD internal command.\n", QColor(255, 255, 0))
+            self.last_command_status = 1
+        
+        pane_instance.append_output(f"{self._get_current_prompt()}", QColor(0, 255, 0))
+
+
     def create_rcmd_command(self):
         """Creates an RCMD file with commands"""
         dialog = QDialog(self)
@@ -1015,25 +1583,36 @@ class PyCMDWindow(QMainWindow):
     
     def save_rcmd_file(self, text_edit, dialog):
         """Saves commands to an RCMD file"""
-        commands = text_edit.toPlainText().strip().split('\n')
-        if commands:
-            file_path, _ = QFileDialog.getSaveFileName(
-                self, "Save RCMD File", "", "Command Files (*.rcmd)"
-            )
-            if file_path:
-                with open(file_path, 'w') as f:
-                    for cmd in commands:
-                        if cmd.strip():  # Ignore empty lines
-                            f.write(cmd.strip() + "\n")
-                
-                current_widget = self.tab_widget.currentWidget()
-                # Find the active pane to display the message
-                focused_pane = self._get_focused_terminal_pane(current_widget)
-                if focused_pane:
-                    focused_pane.append_output(f"Commands saved to {file_path}\n", QColor(0, 255, 0))
-                
-                self.show_native_message("RCMD File Saved", f"RCMD file saved to {file_path}.")
-                dialog.close()
+        try: # Add try-except for traceback
+            commands = text_edit.toPlainText().strip().split('\n')
+            if commands:
+                file_path, _ = QFileDialog.getSaveFileName(
+                    self, "Save RCMD File", "", "Command Files (*.rcmd)"
+                )
+                if file_path:
+                    with open(file_path, 'w', encoding='utf-8') as f:
+                        for cmd in commands:
+                            if cmd.strip():  # Ignore empty lines
+                                f.write(cmd.strip() + "\n")
+                    
+                    current_widget = self.tab_widget.currentWidget()
+                    # Find the active pane to display the message
+                    focused_pane = self._get_focused_terminal_pane(current_widget)
+                    if focused_pane:
+                        focused_pane.append_output(f"Commands saved to {file_path}\n", QColor(0, 255, 0))
+                        focused_pane.append_output(f"{self._get_current_prompt()}", QColor(0, 255, 0)) # Add prompt
+                    
+                    self.show_native_message("RCMD File Saved", f"RCMD file saved to {file_path}.")
+                    dialog.close()
+            self.last_command_status = 0
+        except Exception:
+            current_widget = self.tab_widget.currentWidget()
+            focused_pane = self._get_focused_terminal_pane(current_widget)
+            if focused_pane:
+                focused_pane.append_output(f"Error saving RCMD file:\n{traceback.format_exc()}\n", QColor(255, 0, 0))
+                focused_pane.append_output(f"{self._get_current_prompt()}", QColor(0, 255, 0)) # Add prompt
+            self.show_native_message("Error Saving RCMD File", f"Error saving RCMD file: {traceback.format_exc()}", QMessageBox.Critical)
+            self.last_command_status = 1
 
     def modify_rcmd_command(self):
         """Allows the user to modify an existing RCMD file."""
@@ -1041,13 +1620,23 @@ class PyCMDWindow(QMainWindow):
             self, "Modify RCMD File", self.current_directory, "Command Files (*.rcmd);;All Files (*)"
         )
         if not file_path:
+            self.last_command_status = 1
+            current_widget = self.tab_widget.currentWidget()
+            focused_pane = self._get_focused_terminal_pane(current_widget)
+            if focused_pane:
+                focused_pane.append_output(f"{self._get_current_prompt()}", QColor(0, 255, 0)) # Add prompt
             return
 
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
-        except Exception as e:
-            self.show_native_message("Error Reading File", f"Could not read RCMD file: {e}", QMessageBox.Critical)
+        except Exception: # Add try-except for traceback
+            self.show_native_message("Error Reading File", f"Could not read RCMD file: {traceback.format_exc()}", QMessageBox.Critical)
+            self.last_command_status = 1
+            current_widget = self.tab_widget.currentWidget()
+            focused_pane = self._get_focused_terminal_pane(current_widget)
+            if focused_pane:
+                focused_pane.append_output(f"{self._get_current_prompt()}", QColor(0, 255, 0)) # Add prompt
             return
 
         dialog = QDialog(self)
@@ -1069,7 +1658,7 @@ class PyCMDWindow(QMainWindow):
 
     def _save_modified_rcmd_file(self, file_path, content, dialog):
         """Saves the modified content back to the RCMD file."""
-        try:
+        try: # Add try-except for traceback
             with open(file_path, 'w', encoding='utf-8') as f:
                 f.write(content)
             
@@ -1077,88 +1666,423 @@ class PyCMDWindow(QMainWindow):
             focused_pane = self._get_focused_terminal_pane(current_widget)
             if focused_pane:
                 focused_pane.append_output(f"RCMD file '{os.path.basename(file_path)}' modified successfully.\n", QColor(0, 255, 0))
+                focused_pane.append_output(f"{self._get_current_prompt()}", QColor(0, 255, 0)) # Add prompt
             
             self.show_native_message("RCMD Modified", f"RCMD file '{os.path.basename(file_path)}' saved.")
             dialog.close()
-        except Exception as e:
-            self.show_native_message("Error Saving Changes", f"Could not save changes to RCMD file: {e}", QMessageBox.Critical)
+            self.last_command_status = 0
+        except Exception:
+            current_widget = self.tab_widget.currentWidget()
+            focused_pane = self._get_focused_terminal_pane(current_widget)
+            if focused_pane:
+                focused_pane.append_output(f"Error saving changes to RCMD file:\n{traceback.format_exc()}\n", QColor(255, 0, 0))
+                focused_pane.append_output(f"{self._get_current_prompt()}", QColor(0, 255, 0)) # Add prompt
+            self.show_native_message("Error Saving Changes", f"Could not save changes to RCMD file: {traceback.format_exc()}", QMessageBox.Critical)
+            self.last_command_status = 1
 
-    def execute_rcmd_file(self):
-        """Executes commands from an RCMD file"""
+    def _execute_rcmd_file_from_path(self, file_path, pane_instance):
+        """Executes commands from a given RCMD file path in the specified pane."""
+        if not os.path.exists(file_path):
+            pane_instance.append_output(f"Error: RCMD file not found: {file_path}\n", QColor(255, 0, 0))
+            self.show_native_message("Error", f"RCMD file not found: {file_path}", QMessageBox.Critical)
+            self.last_command_status = 1
+            return
+
+        pane_instance.append_output(f"Executing commands from {file_path}\n", QColor(100, 100, 255))
+        
+        try: # Add try-except for traceback
+            with open(file_path, 'r', encoding='utf-8') as f:
+                for cmd in f:
+                    cmd = cmd.strip()
+                    if cmd:
+                        # Echo the command from the RCMD file
+                        pane_instance.append_output(f"{self._get_current_prompt()}{cmd}\n", QColor(255, 255, 255))
+                        self._execute_single_command_in_pane(pane_instance, cmd)
+            self.last_command_status = 0
+        except Exception:
+            pane_instance.append_output(f"Error reading or executing RCMD file:\n{traceback.format_exc()}\n", QColor(255, 0, 0))
+            self.show_native_message("Error", f"Error reading or executing RCMD file: {traceback.format_exc()}", QMessageBox.Critical)
+            self.last_command_status = 1
+        finally:
+            pane_instance.append_output(f"{self._get_current_prompt()}", QColor(0, 255, 0)) # Add prompt
+            # Auto-save after RCMD execution
+            if self.auto_save_enabled:
+                self._auto_save_session_silent()
+
+
+    def _execute_single_command_in_pane(self, pane_instance, command):
+        """Helper to execute a single command directly within a pane's context."""
+        # This logic is similar to a part of execute_command_in_pane, but without
+        # the initial "> command" output and command_entry clearing, as it's for internal use.
+
+        # Stop any previous command thread for THIS pane
+        if pane_instance.command_thread and pane_instance.command_thread.isRunning():
+            pane_instance.stop_pane_thread()
+
+        command_handled_internally = False
+
+        try: # Wrap internal command handling in a try-except for traceback
+            if command.lower().startswith("pycmd echocolor="):
+                self.handle_echocolor(command, pane_instance)
+                command_handled_internally = True
+            elif command.lower() == "cls":
+                pane_instance.output_text.clear()
+                pane_instance.output_text.setText(self.welcome_message)
+                pane_instance.append_output(f"\n{self._get_current_prompt()}", QColor(0, 255, 0)) # Add prompt
+                command_handled_internally = True
+            elif command.lower() == "help":
+                self.show_help()
+                command_handled_internally = True
+            elif command.lower().startswith("cd "):
+                self.change_directory(command, pane_instance)
+                command_handled_internally = True
+            elif command.lower() == "pycmd save":
+                self.save_session()
+                command_handled_internally = True
+            elif command.lower() == "pycmd open":
+                self.open_session()
+                command_handled_internally = True
+            elif command.lower() == "pycmd create rcmd":
+                self.create_rcmd_command()
+                command_handled_internally = True
+            elif command.lower() == "pycmd modify rcmd":
+                self.modify_rcmd_command()
+                command_handled_internally = True
+            elif command.lower() == "pycmd rcmd":
+                # Avoid infinite recursion if an RCMD file calls 'pycmd rcmd' without a path
+                pane_instance.append_output("Error: 'pycmd rcmd' cannot be called recursively without a specific file path within an RCMD file.\n", QColor(255, 0, 0))
+                command_handled_internally = True
+            elif command.lower() == "pycmd admin_only_command":
+                if self.is_admin_mode:
+                    pane_instance.append_output("<span style='color: yellow;'>[ADMIN MODE] Executing sensitive operation...</span>\n", QColor(255, 255, 0))
+                else:
+                    pane_instance.append_output("<span style='color: red;'>Access Denied: This command requires Administrator privileges.</span>\n", QColor(255, 0, 0))
+                command_handled_internally = True
+            elif command.lower() == "pycmd systeminfo": # New systeminfo command
+                self._handle_systeminfo(pane_instance)
+                command_handled_internally = True
+            elif command.lower() == "ls": # New ls command
+                self._handle_ls(pane_instance)
+                command_handled_internally = True
+            elif command.lower().startswith("set "): # New set command
+                self._handle_set_command(command, pane_instance)
+                command_handled_internally = True
+            elif command.lower().startswith("echo "): # Enhanced echo command
+                self._handle_echo_command(command, pane_instance)
+                command_handled_internally = True
+            elif command.lower() == "pwd": # New pwd command
+                self._handle_pwd_command(pane_instance)
+                command_handled_internally = True
+            elif command.lower().startswith("open "): # New open command
+                self._handle_open_command(command, pane_instance)
+                command_handled_internally = True
+            elif command.lower().startswith("math "): # New math command
+                self._handle_math_command(command, pane_instance)
+                command_handled_internally = True
+            elif command.lower().startswith("read "): # New read command
+                self._handle_read_command(command, pane_instance)
+                command_handled_internally = True
+            elif command.lower().startswith("type "): # New type command
+                self._handle_type_command(command, pane_instance)
+                command_handled_internally = True
+            elif command.lower().startswith("python ") or command.lower() == "python":
+                if self.selected_interpreter == "pycmd":
+                    self.execute_python_code(command, pane_instance) # Pass pane_instance directly
+                    command_handled_internally = True
+                else:
+                    if self.selected_interpreter == "cmd":
+                        command_args = ["cmd.exe", "/c", command]
+                    elif self.selected_interpreter == "powershell":
+                        command_args = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command]
+                    else:
+                        command_args = [command]
+                    pane_instance.start_command_execution(command_args, self.current_directory, self.selected_interpreter)
+                    command_handled_internally = True
+            elif command.lower().startswith("pycmd autosave "):
+                state = command[len("pycmd autosave "):].strip().lower()
+                if state == "on":
+                    self.toggle_auto_save(True)
+                    pane_instance.append_output("Auto Save Session: ON\n", QColor(0, 255, 0))
+                elif state == "off":
+                    self.toggle_auto_save(False)
+                    pane_instance.append_output("Auto Save Session: OFF\n", QColor(255, 255, 0))
+                else:
+                    pane_instance.append_output("Error: Invalid argument for pycmd autosave. Use 'on' or 'off'.\n", QColor(255, 0, 0))
+                command_handled_internally = True
+            elif command.lower().startswith("pycmd autoload "):
+                state = command[len("pycmd autoload "):].strip().lower()
+                if state == "on":
+                    self.toggle_auto_load(True)
+                    pane_instance.append_output("Auto Load Session: ON\n", QColor(0, 255, 0))
+                elif state == "off":
+                    self.toggle_auto_load(False)
+                    pane_instance.append_output("Auto Load Session: OFF\n", QColor(255, 255, 0))
+                else:
+                    pane_instance.append_output("Error: Invalid argument for pycmd autoload. Use 'on' or 'off'.\n", QColor(255, 0, 0))
+                command_handled_internally = True
+            elif command.lower() == "pycmd autosave_now":
+                self._auto_save_session_silent()
+                pane_instance.append_output("Session auto-saved silently.\n", QColor(0, 255, 0))
+                command_handled_internally = True
+
+            if not command_handled_internally:
+                if self.selected_interpreter == "pycmd":
+                    pane_instance.append_output(f"Error: Unrecognized pyCMD internal command: '{command}'\n", QColor(255, 0, 0))
+                    pane_instance.append_output(f"{self._get_current_prompt()}", QColor(0, 255, 0)) # Add prompt
+                else:
+                    if self.selected_interpreter == "cmd":
+                        command_args = ["cmd.exe", "/c", command]
+                    elif self.selected_interpreter == "powershell":
+                        command_args = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command]
+                    else:
+                        command_args = [command]
+                    pane_instance.start_command_execution(command_args, self.current_directory, self.selected_interpreter)
+                    # Prompt will be added by command_thread_finished for external commands
+
+        except Exception:
+            pane_instance.append_output(f"An internal pyCMD error occurred:\n{traceback.format_exc()}\n", QColor(255, 0, 0))
+            pane_instance.append_output(f"{self._get_current_prompt()}", QColor(0, 255, 0)) # Add prompt
+
+
+    def execute_rcmd_file(self, pane_instance=None): # Now accepts optional pane_instance
+        """Executes commands from an RCMD file chosen via a file dialog."""
         file_path, _ = QFileDialog.getOpenFileName(
             self, "Open RCMD File", "", "Command Files (*.rcmd)"
         )
         if file_path:
-            current_tab_widget = self.tab_widget.currentWidget()
-            focused_pane = self._get_focused_terminal_pane(current_tab_widget)
+            # If no pane_instance is provided (e.g., from menu), get the currently focused one
+            if pane_instance is None:
+                current_tab_widget = self.tab_widget.currentWidget()
+                pane_instance = self._get_focused_terminal_pane(current_tab_widget)
 
-            if not focused_pane:
+            if pane_instance:
+                self._execute_rcmd_file_from_path(file_path, pane_instance)
+            else:
                 self.show_native_message("Error", "No active terminal pane found to execute RCMD file.", QMessageBox.Critical)
-                return
-
-            output_text = focused_pane.output_text
-            command_entry = focused_pane.command_entry
-            
-            focused_pane.append_output(f"Opening commands from {file_path}\n", QColor(100, 100, 255))
-            
-            with open(file_path, 'r') as f:
-                for cmd in f:
-                    cmd = cmd.strip()
-                    if cmd:
-                        focused_pane.append_output(f"{cmd}\n", QColor(255, 255, 255))
-                        command_entry.setText(cmd)
-                        self.execute_command_in_pane(focused_pane, cmd) # Execute in the focused pane
     
     def save_session(self):
-        """Saves the current session to a file"""
-        file_path, _ = QFileDialog.getSaveFileName(
-            self, "Save Session", "", "Session Files (*.session)"
-        )
-        if file_path:
-            with open(file_path, 'w', encoding='utf-8') as f:
+        """Saves the current session to a file, including tab structure, content (with colors), and history."""
+        try:
+            file_path, _ = QFileDialog.getSaveFileName(
+                self, "Save Session", "", "Session Files (*.session)"
+            )
+            if file_path:
+                session_data = []
                 for i in range(self.tab_widget.count()):
-                    widget = self.tab_widget.widget(i)
-                    # For split terminals, we need to save the content of all panes
-                    self._save_pane_contents(widget, f, self.tab_widget.tabText(i))
-            
-            self.show_native_message("Session Saved", f"Session saved to {file_path}.")
+                    tab_widget = self.tab_widget.widget(i)
+                    tab_title = self.tab_widget.tabText(i)
+                    
+                    # Extract group name from tab title
+                    title_match = re.match(r'\[(.*?)\]\s*(.*)', tab_title)
+                    group_name = title_match.group(1) if title_match else "Default"
+                    base_title = title_match.group(2) if title_match else tab_title
 
-    def _save_pane_contents(self, widget, file_handle, tab_title, pane_index=0):
-        """Recursively saves the content of TerminalPanes."""
+                    # Get the main splitter or pane of the tab
+                    main_content_widget = tab_widget.layout().itemAt(0).widget()
+                    
+                    panes_data = self._get_pane_data(main_content_widget)
+                    
+                    session_data.append({
+                        "title": base_title,
+                        "group_name": group_name,
+                        "panes_data": panes_data
+                    })
+                
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    json.dump(session_data, f, indent=4)
+                
+                self.show_native_message("Session Saved", f"Session saved to {file_path}.")
+            current_widget = self.tab_widget.currentWidget()
+            focused_pane = self._get_focused_terminal_pane(current_widget)
+            if focused_pane:
+                focused_pane.append_output(f"{self._get_current_prompt()}", QColor(0, 255, 0)) # Add prompt
+        except Exception:
+            current_widget = self.tab_widget.currentWidget()
+            focused_pane = self._get_focused_terminal_pane(current_widget)
+            if focused_pane:
+                focused_pane.append_output(f"Error saving session:\n{traceback.format_exc()}\n", QColor(255, 0, 0))
+                focused_pane.append_output(f"{self._get_current_prompt()}", QColor(0, 255, 0)) # Add prompt
+            self.show_native_message("Error Saving Session", f"Error saving session: {traceback.format_exc()}", QMessageBox.Critical)
+
+    def _auto_save_session_silent(self):
+        """Silently saves the current session to the predefined auto-session file."""
+        try:
+            os.makedirs(self.config_dir, exist_ok=True) # Ensure config directory exists
+            session_data = []
+            for i in range(self.tab_widget.count()):
+                tab_widget = self.tab_widget.widget(i)
+                tab_title = self.tab_widget.tabText(i)
+                
+                title_match = re.match(r'\[(.*?)\]\s*(.*)', tab_title)
+                group_name = title_match.group(1) if title_match else "Default"
+                base_title = title_match.group(2) if title_match else tab_title
+
+                main_content_widget = tab_widget.layout().itemAt(0).widget()
+                panes_data = self._get_pane_data(main_content_widget)
+                
+                session_data.append({
+                    "title": base_title,
+                    "group_name": group_name,
+                    "panes_data": panes_data
+                })
+            
+            with open(self.auto_session_file, 'w', encoding='utf-8') as f:
+                json.dump(session_data, f, indent=4)
+            # print(f"Session auto-saved to {self.auto_session_file}") # For debugging
+        except Exception as e:
+            print(f"Error during silent auto-save: {e}") # Log error, but don't interrupt user
+
+    def _get_pane_data(self, widget):
+        """Recursively extracts data from TerminalPanes and QSplitters."""
         if isinstance(widget, TerminalPane):
-            content = widget.output_text.toPlainText()
-            file_handle.write(f"# TAB {tab_title} - PANE {pane_index}\n{content}\n")
+            return {
+                "type": "pane",
+                "content": widget.output_text.toHtml(), # Save as HTML to preserve colors
+                "history": widget.command_history
+            }
+        elif isinstance(widget, QSplitter):
+            children_data = []
+            for i in range(widget.count()):
+                children_data.append(self._get_pane_data(widget.widget(i)))
+            return {
+                "type": "splitter",
+                "orientation": "horizontal" if widget.orientation() == Qt.Horizontal else "vertical",
+                "sizes": widget.sizes(), # Save splitter sizes
+                "children": children_data
+            }
+        return None # Should not happen with current UI structure
+
+    def open_session(self, file_path=None): # Modified to accept optional file_path
+        """Opens a saved session from a file, restoring tab structure, content, and history."""
+        if file_path is None: # If no path is provided, open a file dialog
+            file_path, _ = QFileDialog.getOpenFileName(
+                self, "Open Session", "", "Session Files (*.session)"
+            )
+        
+        if file_path:
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    session_data = json.load(f)
+                
+                # Clear all existing tabs
+                while self.tab_widget.count() > 0:
+                    self.close_tab(0) # Use close_tab to ensure threads are stopped
+                
+                for tab_data in session_data:
+                    title = tab_data.get("title", "Restored Tab")
+                    group_name = tab_data.get("group_name", "Default")
+                    panes_data = tab_data.get("panes_data")
+
+                    # Create a new tab and reconstruct its content
+                    self.create_new_tab(
+                        title=title,
+                        group_name=group_name,
+                        pane_data=panes_data # Pass structured data for reconstruction
+                    )
+                
+                self.show_native_message("Session Loaded", f"Session loaded from {file_path}.")
+            except Exception:
+                current_widget = self.tab_widget.currentWidget()
+                focused_pane = self._get_focused_terminal_pane(current_widget)
+                if focused_pane:
+                    focused_pane.append_output(f"Error loading session:\n{traceback.format_exc()}\n", QColor(255, 0, 0))
+                    focused_pane.append_output(f"{self._get_current_prompt()}", QColor(0, 255, 0)) # Add prompt
+                self.show_native_message("Error Loading Session", f"Error loading session: {traceback.format_exc()}", QMessageBox.Critical)
+        current_widget = self.tab_widget.currentWidget()
+        focused_pane = self._get_focused_terminal_pane(current_widget)
+        if focused_pane:
+            focused_pane.append_output(f"{self._get_current_prompt()}", QColor(0, 255, 0)) # Add prompt
+
+    def _auto_load_session(self):
+        """Attempts to load the auto-saved session if enabled."""
+        if self.auto_load_enabled and os.path.exists(self.auto_session_file):
+            print(f"Attempting to auto-load session from {self.auto_session_file}") # For debugging
+            self.open_session(self.auto_session_file)
+        else:
+            print("Auto-load session not enabled or file not found.") # For debugging
+
+    def _create_panes_from_data(self, data):
+        """Recursively creates TerminalPanes and QSplitters from structured data."""
+        if data["type"] == "pane":
+            pane = self._create_terminal_pane()
+            pane.output_text.setHtml(data.get("content", "")) # Set HTML content
+            pane.command_history = data.get("history", []) # Restore history
+            return pane
+        elif data["type"] == "splitter":
+            splitter = QSplitter(Qt.Horizontal if data.get("orientation") == "horizontal" else Qt.Vertical)
+            for child_data in data.get("children", []):
+                splitter.addWidget(self._create_panes_from_data(child_data))
+            if "sizes" in data and len(data["sizes"]) == splitter.count(): # Only set sizes if count matches
+                splitter.setSizes(data["sizes"]) # Restore splitter sizes
+            return splitter
+        return None
+
+    def _find_first_terminal_pane(self, widget):
+        """Recursively finds the first TerminalPane within a widget hierarchy."""
+        if isinstance(widget, TerminalPane):
+            return widget
         elif isinstance(widget, QSplitter):
             for i in range(widget.count()):
-                self._save_pane_contents(widget.widget(i), file_handle, tab_title, pane_index + i)
+                found_pane = self._find_first_terminal_pane(widget.widget(i))
+                if found_pane:
+                    return found_pane
         elif isinstance(widget, QWidget) and widget.layout():
             for i in range(widget.layout().count()):
                 item = widget.layout().itemAt(i)
                 if item.widget():
-                    self._save_pane_contents(item.widget(), file_handle, tab_title, pane_index + i)
+                    found_pane = self._find_first_terminal_pane(item.widget())
+                    if found_pane:
+                        return found_pane
+        return None
     
-    def open_session(self):
-        """Opens a saved session from a file"""
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "Open Session", "", "Session Files (*.session)"
-        )
-        if file_path:
-            # Create a new tab for the restored session
-            self.create_new_tab("Restored Tab")
-            current_tab_widget = self.tab_widget.currentWidget()
-            # Get the initial pane of the new tab
-            main_splitter = current_tab_widget.layout().itemAt(0).widget()
-            initial_pane = main_splitter.widget(0)
-            
+    def _load_config(self):
+        """Loads auto-save/load configuration from file."""
+        if os.path.exists(self.config_file):
             try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                    # For simplicity, load all content into the first pane of the new tab
-                    initial_pane.output_text.setPlainText(content)
-                self.show_native_message("Session Loaded", f"Session loaded from {file_path}.")
+                with open(self.config_file, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+                self.auto_save_enabled = config.get('auto_save_enabled', False)
+                self.auto_load_enabled = config.get('auto_load_enabled', False)
             except Exception as e:
-                initial_pane.append_output(f"Error loading session: {e}\n", QColor(255, 0, 0))
-                self.show_native_message("Error Loading Session", f"Error loading session: {e}", QMessageBox.Critical)
+                print(f"Error loading config file: {e}")
+                # Reset to default if loading fails
+                self.auto_save_enabled = False
+                self.auto_load_enabled = False
+        else:
+            print("Config file not found. Using default settings.")
+
+    def _save_config(self):
+        """Saves auto-save/load configuration to file."""
+        try:
+            os.makedirs(self.config_dir, exist_ok=True)
+            config = {
+                'auto_save_enabled': self.auto_save_enabled,
+                'auto_load_enabled': self.auto_load_enabled
+            }
+            with open(self.config_file, 'w', encoding='utf-8') as f:
+                json.dump(config, f, indent=4)
+        except Exception as e:
+            print(f"Error saving config file: {e}")
+
+    def toggle_auto_save(self, checked):
+        """Toggles auto-save feature and saves configuration."""
+        self.auto_save_enabled = checked
+        self._save_config()
+        # Update menu action state
+        for action in self.findChildren(QAction):
+            if action.text() == "Auto Save Session":
+                action.setChecked(checked)
+                break
+
+    def toggle_auto_load(self, checked):
+        """Toggles auto-load feature and saves configuration."""
+        self.auto_load_enabled = checked
+        self._save_config()
+        # Update menu action state
+        for action in self.findChildren(QAction):
+            if action.text() == "Auto Load Session":
+                action.setChecked(checked)
+                break
     
     def reload_app(self):
         """Reloads the application"""
@@ -1168,20 +2092,46 @@ class PyCMDWindow(QMainWindow):
     def show_help(self):
         """Shows the help for available commands"""
         help_message = """
-Available Commands:
+Available Commands (pyCMD interpreter):
 cls - Clear screen
 help - Show this help message
+ls - List directory contents
+set [VAR_NAME[=VALUE]] - Set or display shell variables
+echo [TEXT | $VAR_NAME] - Display text or variable values
+pwd - Print current working directory
+open <file_path> - Open a file with its default application
+math <expression> - Perform mathematical calculations
+read <variable_name> - Read a line of input into a variable
+type <command_name> - Indicate how a command would be interpreted
 pyCMD save - Save current session
 pyCMD open - Open a saved session
 pyCMD create rcmd - Create RCMD commands
 pyCMD modify rcmd - Modify an existing RCMD command
-pyCMD rcmd - Execute RCMD commands
+pyCMD rcmd - Execute RCMD commands (via file dialog)
 pyCMD echocolor=(*color*)=("*text*") - Colored text output
 pyCMD admin_only_command - Example of an admin-only command (requires running as Administrator)
-Almost ALL Windows Terminal commands are here
-All PYTHON commands are here
+pyCMD systeminfo - Display system information
+pyCMD autosave [on|off] - Toggle auto-save session
+pyCMD autoload [on|off] - Toggle auto-load session
+pyCMD autosave_now - Force a silent auto-save
+
+Variables (pyCMD interpreter):
+$PATH - System's executable search path
+$HOME - User's home directory
+$USER - Current username
+$HOSTNAME - Current machine hostname
+$status - Exit code of the last executed command
+$pyCMD_pid - Process ID of the current pyCMD instance
+$pyCMD_history - Path to the hypothetical history file
+
+Other Interpreters (Windows CMD, PowerShell):
+Most native Windows CMD/PowerShell commands are supported.
 """
         self.show_native_message("Help", help_message)
+        current_widget = self.tab_widget.currentWidget()
+        focused_pane = self._get_focused_terminal_pane(current_widget)
+        if focused_pane:
+            focused_pane.append_output(f"{self._get_current_prompt()}", QColor(0, 255, 0)) # Add prompt
     
     def show_color_tutorial(self):
         """Shows the tutorial for changing colors"""
@@ -1196,6 +2146,63 @@ All PYTHON commands are here
             "Example: pyCMD echocolor=(light_blue)=(\"Hello World!\")"
         )
         self.show_native_message("Color Tutorial", tutorial_message)
+        current_widget = self.tab_widget.currentWidget()
+        focused_pane = self._get_focused_terminal_pane(current_widget)
+        if focused_pane:
+            focused_pane.append_output(f"{self._get_current_prompt()}", QColor(0, 255, 0)) # Add prompt
+
+    def set_pyCMD_default(self):
+        """
+        Attempts to directly open Windows settings for file associations.
+        The user will still need to manually select .rcmd and then pyCMD.
+        Includes an explanation why it's not fully automatic.
+        """
+        if os.name == 'nt':  # Only for Windows
+            try:
+                # This command opens the Windows 'Default apps by file type' settings page.
+                # The user will need to scroll and find .rcmd.
+                subprocess.run(["start", "ms-settings:defaultapps-byfiletype"], shell=True, check=True)
+
+                # Message to the user after attempting to open settings
+                instructions = """
+                <b>Redirected to Windows Settings!</b>
+                <p>We've redirected you to the "Default apps by file type" section in Windows Settings.</p>
+                <p>Please follow these steps to set pyCMD as the default application for <code>.rcmd</code> files:</p>
+                <ol>
+                    <li>Scroll down until you find the <code><b>.rcmd</b></code> and <code><b>.sessions</b></code> file extension.</li>
+                    <li>Click on the program currently associated with it (or the button to choose one).</li>
+                    <li>Select <b>pyCMD</b> from the list. If it's not listed, click "Look for another app on this PC" and navigate to your <code>pyCMD.exe</code> location.</li>
+                </ol>
+                ---
+                <p><b>Why isn't this fully automatic?</b></p>
+                <p>This process requires manual steps from you due to fundamental **operating system security restrictions**. Windows (and other modern operating systems) prevents any application from automatically changing file associations without explicit user confirmation.</p>
+                <p>This is a crucial security measure to:</p>
+                <ul>
+                    <li><b>Prevent Malware:</b> Stop malicious software from "hijacking" your file types and running harmful code every time you open a common file like a document or an image.</li>
+                    <li><b>Maintain User Control:</b> Ensure that *you*, the user, always have the final say over how your files are opened.</li>
+                </ul>
+                <p>Even major web browsers follow a similar protocol; they can *request* to be default, but Windows always steps in to require your confirmation. Your pyCMD application, like any other third-party app, must adhere to these protective measures.</p>
+                <p>Thank you for your understanding and cooperation!</p>
+                """
+                self.show_native_message("Set .rcmd Default", instructions, QMessageBox.Information)
+
+            except Exception as e:
+                self.show_native_message(
+                    "Error Opening Settings",
+                    f"Could not open Windows settings. Error: {e}\n\n"
+                    "Please navigate manually to: Settings > Apps > Default apps > Choose default apps by file type.",
+                    QMessageBox.Critical
+                )
+        else:
+            self.show_native_message(
+                "Windows-Only Feature",
+                "This automatic redirection feature is only available on Windows.",
+                QMessageBox.Information
+            )
+        current_widget = self.tab_widget.currentWidget()
+        focused_pane = self._get_focused_terminal_pane(current_widget)
+        if focused_pane:
+            focused_pane.append_output(f"{self._get_current_prompt()}", QColor(0, 255, 0)) # Add prompt
 
     def setup_menu(self):
         """Configures the menu bar with native style"""
@@ -1208,6 +2215,9 @@ All PYTHON commands are here
         pycmd_menu.addAction(QIcon.fromTheme("view-refresh"), "Changelog", self.show_changelog)
         pycmd_menu.addAction(QIcon.fromTheme("help-about"), "About", self.show_about)
         pycmd_menu.addSeparator()
+        # Removed generic icon, as no specific icon was provided for "preferences-system"
+        pycmd_menu.addAction("Set pyCMD default", self.set_pyCMD_default) 
+        pycmd_menu.addSeparator()
         pycmd_menu.addAction(QIcon.fromTheme("system-restart"), "Reload Application", self.reload_app)
         pycmd_menu.addAction(QIcon.fromTheme("application-exit"), "Exit", self.close)
         
@@ -1215,6 +2225,20 @@ All PYTHON commands are here
         file_menu = menubar.addMenu("File")
         file_menu.setStyleSheet("")  # Native style
         file_menu.addAction(QIcon.fromTheme("document-new"), "New Tab", lambda: self.create_new_tab("System Symbol"))
+        
+        # Auto Save Session Action
+        self.auto_save_action = QAction("Auto Save Session", self, checkable=True)
+        self.auto_save_action.setChecked(self.auto_save_enabled)
+        self.auto_save_action.triggered.connect(self.toggle_auto_save)
+        file_menu.addAction(self.auto_save_action)
+
+        # Auto Load Session Action
+        self.auto_load_action = QAction("Auto Load Session", self, checkable=True)
+        self.auto_load_action.setChecked(self.auto_load_enabled)
+        self.auto_load_action.triggered.connect(self.toggle_auto_load)
+        file_menu.addAction(self.auto_load_action)
+
+        file_menu.addSeparator()
         file_menu.addAction(QIcon.fromTheme("document-save"), "Save Session", self.save_session)
         file_menu.addSeparator()
         file_menu.addAction(QIcon.fromTheme("document-open"), "Open Session", self.open_session)
@@ -1264,6 +2288,10 @@ All PYTHON commands are here
                 self.show_native_message("Elevation Error", "Could not start the application with administrator privileges.", QMessageBox.Critical)
         else:
             self.show_native_message("Information", "The application is already running with administrator privileges.", QMessageBox.Information)
+        current_widget = self.tab_widget.currentWidget()
+        focused_pane = self._get_focused_terminal_pane(current_widget)
+        if focused_pane:
+            focused_pane.append_output(f"{self._get_current_prompt()}", QColor(0, 255, 0)) # Add prompt
 
 
     def _get_focused_terminal_pane(self, parent_widget):
@@ -1334,6 +2362,9 @@ All PYTHON commands are here
                 new_splitter.addWidget(new_pane)
                 tab_layout.addWidget(new_splitter)
                 focused_pane.command_entry.setFocus()
+                # Auto-save after splitting a pane
+                if self.auto_save_enabled:
+                    self._auto_save_session_silent()
                 return
             else:
                 self.show_native_message("Split Error", "Could not find a suitable parent splitter for the active pane.", QMessageBox.Warning)
@@ -1364,6 +2395,11 @@ All PYTHON commands are here
 
         # Ensure the layout updates
         current_tab.layout().update()
+        
+        # Auto-save after splitting a pane
+        if self.auto_save_enabled:
+            self._auto_save_session_silent()
+
 
     def split_horizontal(self):
         # This function name now corresponds to the visual effect of a horizontal dividing line (top/bottom panes)
@@ -1373,6 +2409,55 @@ All PYTHON commands are here
         # This function name now corresponds to the visual effect of a vertical dividing line (left/right panes)
         self.split_current_pane(Qt.Vertical)
 
+    def _handle_dragged_file_execution(self, file_path, pane_instance):
+        """Handles the execution of dragged and dropped files based on their extension."""
+        if not os.path.exists(file_path):
+            pane_instance.append_output(f"Error: File not found: {file_path}\n", QColor(255, 0, 0))
+            self.last_command_status = 1
+            return
+
+        file_extension = os.path.splitext(file_path)[1].lower()
+        command_to_execute = None
+        interpreter_mode = None
+
+        if file_extension == ".rcmd":
+            pane_instance.append_output(f"Executing RCMD file: {file_path}\n", QColor(150, 255, 150))
+            self._execute_rcmd_file_from_path(file_path, pane_instance)
+            return # RCMD files are handled internally, no external process needed here
+        elif file_extension == ".session": # Handle .session files
+            pane_instance.append_output(f"Loading session file: {file_path}\n", QColor(150, 255, 150))
+            self.open_session(file_path) # Call open_session with the file path
+            return # Session files are handled internally, no external process needed here
+        elif file_extension == ".bat":
+            command_to_execute = ["cmd.exe", "/c", file_path]
+            interpreter_mode = "cmd"
+        elif file_extension == ".vbs":
+            command_to_execute = ["cscript.exe", "//NoLogo", file_path]
+            interpreter_mode = "cmd" # cscript is a cmd utility
+        elif file_extension == ".sh":
+            if platform.system() == "Windows":
+                # Try to use bash.exe on Windows (e.g., from Git Bash or WSL)
+                try:
+                    subprocess.run(["bash.exe", "--version"], check=True, capture_output=True)
+                    command_to_execute = ["bash.exe", file_path]
+                    interpreter_mode = "powershell" # Can be executed from PowerShell
+                except (subprocess.CalledProcessError, FileNotFoundError):
+                    pane_instance.append_output(f"Error: .sh files require 'bash.exe' (e.g., Git Bash) to be in your system PATH on Windows.\n", QColor(255, 0, 0))
+                    self.last_command_status = 1
+                    return
+            else: # Linux/macOS
+                command_to_execute = ["sh", file_path] # Use default shell
+                interpreter_mode = "powershell" # Generic shell interpreter
+        else:
+            pane_instance.append_output(f"Error: Unsupported file type for direct execution: '{file_extension}'.\n", QColor(255, 0, 0))
+            pane_instance.append_output(f"Consider using 'open {file_path}' or switching to 'Windows CMD' or 'PowerShell' interpreter and running the command directly.\n", QColor(255, 255, 0))
+            self.last_command_status = 1
+            return
+
+        if command_to_execute:
+            pane_instance.append_output(f"Executing '{file_path}'...\n", QColor(150, 255, 150))
+            pane_instance.start_command_execution(command_to_execute, os.path.dirname(file_path), interpreter_mode)
+            # The prompt will be added by command_thread_finished
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
@@ -1400,23 +2485,21 @@ if __name__ == "__main__":
     window = PyCMDWindow()
     window.show()
 
-    # Handle files opened via command line arguments
+    # Handle files opened via command line arguments (e.g., drag and drop)
     if len(sys.argv) > 1:
         file_to_execute = sys.argv[1]
         # Get the initial pane widgets from the first tab
         # Assuming the first tab always has at least one TerminalPane inside its splitter
         first_tab_widget = window.tab_widget.widget(0)
         main_splitter = first_tab_widget.layout().itemAt(0).widget() # Get the splitter
-        initial_pane = main_splitter.widget(0) # Get the first pane inside the splitter
+        initial_pane = window._find_first_terminal_pane(main_splitter) # Use helper to find the first pane
 
-        output_text_widget = initial_pane.output_text
-        command_entry_widget = initial_pane.command_entry
-
-        if os.path.exists(file_to_execute):
-            window.append_output(f"Opening file via command line: {file_to_execute}\n", QColor(150, 255, 150), initial_pane)
-            # Simulate file execution by setting the text and calling execute_command_in_pane
-            window.execute_command_in_pane(initial_pane, file_to_execute)
+        if initial_pane:
+            window._handle_dragged_file_execution(file_to_execute, initial_pane)
+            # Add prompt after handling command line arguments
+            initial_pane.append_output(f"{window._get_current_prompt()}", QColor(0, 255, 0))
         else:
-            window.append_output(f"Error: File not found: {file_to_execute}\n", QColor(255, 0, 0), initial_pane)
+            print("Error: No terminal pane found in the initial tab to handle dragged file.")
+
 
     sys.exit(app.exec())
