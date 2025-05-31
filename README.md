@@ -1,3 +1,4 @@
+![Captura de pantalla 2025-05-30 213017](https://github.com/user-attachments/assets/29e33f40-7107-47cd-8651-eced174b7d56)
 # pyCMD (BETA) 🚀🐍 | The Advanced Interactive Command-Line Interface
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
