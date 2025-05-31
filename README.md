@@ -41,8 +41,3 @@ However, it's important to note that while extensive, **this emulation is not ye
 
 1.  **Download Latest Release:**
     Visit the **pyCMD Releases page** and download the appropriate package for your operating system. ⬇️
-
-2.  **Installation Guide:**
-    For detailed installation instructions and system requirements, please refer to our comprehensive [Installation Guide](link-to-your-installation-guide).
-
----
